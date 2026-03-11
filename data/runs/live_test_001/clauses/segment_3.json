@@ -1,0 +1,16 @@
+[
+  {
+    "clause_id": "3",
+    "clause_title": "采购服务信息章节",
+    "clause_text": "三、采购服务信息",
+    "segment_id": "segment_3",
+    "segment_title": "三、采购服务信息"
+  },
+  {
+    "clause_id": "3.1",
+    "clause_title": "服务条目1的服务信息",
+    "clause_text": "| 编号 | 服务名称 | 服务内容 | 技术参数 | 服务期 |\n| --- | --- | --- | --- | --- |\n| 1 | | 详见投标\n（响应文件） | 详细清单及技术参数见后附表 | |",
+    "segment_id": "segment_3",
+    "segment_title": "三、采购服务信息"
+  }
+]

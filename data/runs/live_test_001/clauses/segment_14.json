@@ -1,0 +1,23 @@
+[
+  {
+    "clause_id": "1",
+    "clause_title": "服务及配套部件的合规与质量保证",
+    "clause_text": "保证所提供服务为投标文件承诺服务，符合相关法律法规规定并且满足甲方的需求，保证其配套项目部件为全新的未使用的且符合相关的质量要求。",
+    "segment_id": "segment_14",
+    "segment_title": "十四、乙方责任"
+  },
+  {
+    "clause_id": "2",
+    "clause_title": "售后服务承诺及执行",
+    "clause_text": "保证所提供服务的售后服务，严格依据投标文件及相关承诺，对服务以及与之配套的项目进行保修、维护等服务。",
+    "segment_id": "segment_14",
+    "segment_title": "十四、乙方责任"
+  },
+  {
+    "clause_id": "3",
+    "clause_title": "知识产权侵权责任保证",
+    "clause_text": "保证其所供服务不存在侵犯第三方知识产权的行为，否则由此产生的损失由乙方承担。",
+    "segment_id": "segment_14",
+    "segment_title": "十四、乙方责任"
+  }
+]

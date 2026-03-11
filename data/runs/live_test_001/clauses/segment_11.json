@@ -1,0 +1,44 @@
+[
+  {
+    "clause_id": "1",
+    "clause_title": "服务质量保证期限及质保期内责任",
+    "clause_text": "服务质量保证期限自提交服务验收合格之日起 个月，在质量保证期内，乙方应对服务出现的问题负责处理并承担一切费用，并且赔偿甲方的损失。",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  },
+  {
+    "clause_id": "2",
+    "clause_title": "服务体系及本地化售后能力",
+    "clause_text": "乙方有完善的服务体系，有能力提供持续的、本地化售后服务。",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  },
+  {
+    "clause_id": "3.1",
+    "clause_title": "系统安装和调试责任",
+    "clause_text": "乙方负责系统安装和调试",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  },
+  {
+    "clause_id": "3.2",
+    "clause_title": "操作人员培训及计划",
+    "clause_text": "乙方负责操作人员培训，并制定详细的培训计划，使操作人员能独立进行管理、操作、维护和故障处理等工作",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  },
+  {
+    "clause_id": "3.3",
+    "clause_title": "记录及技术文档收集移交",
+    "clause_text": "做好相关记录及技术文档收集整理，待验收后移交",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  },
+  {
+    "clause_id": "4",
+    "clause_title": "服务范围",
+    "clause_text": "服务范围：负责招标文件所涉及到的所有服务。",
+    "segment_id": "segment_11",
+    "segment_title": "十一、售后服务及承诺"
+  }
+]
