@@ -66,7 +66,7 @@ export function RiskPanel(props: {
       </div>
 
       {!props.result ? (
-        <div className="emptyState">请先上传并发起审查，或点击“加载演示”。</div>
+        <div className="emptyState">请先在左侧进入“文件上传”，开始新的合同审查。</div>
       ) : (
         <>
           <div className="riskControls">

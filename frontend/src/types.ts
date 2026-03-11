@@ -1,15 +1,12 @@
-export type ReviewStatus = 'queued' | 'running' | 'completed' | 'failed'
-
 export type ReviewMeta = {
   run_id: string
-  status: ReviewStatus
+  status: 'queued' | 'running' | 'completed' | 'failed'
   file_name?: string
   review_side?: string
   contract_type_hint?: string
   step?: string
   error?: string
   warning?: string
-  updated_at?: string
 }
 
 export type Clause = {
@@ -39,7 +36,6 @@ export type RiskItem = {
   clause_uid?: string
   clause_uids?: string[]
   display_clause_ids?: string[]
-  risk_source_type?: 'anchored' | 'missing_clause'
 }
 
 export type ReviewResultPayload = {
@@ -72,19 +68,15 @@ export type EditSummary = {
 }
 
 export type ReviewHistoryItem = {
+  id: string
   run_id: string
-  status: ReviewStatus
   file_name?: string
-  review_side?: string
-  contract_type_hint?: string
-  step?: string
-  error?: string
-  warning?: string
-  updated_at?: string
-  download_ready: boolean
-  document_ready: boolean
-}
-
-export type ReviewHistoryResponse = {
-  items: ReviewHistoryItem[]
+  status: ReviewMeta['status']
+  summary?: string
+  updated_at: string
+  created_at: string
+  available: boolean
+  file?: File | null
+  meta?: ReviewMeta | null
+  result?: ReviewResultPayload | null
 }

@@ -1,36 +1,83 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEditor'
-import { HomeDashboard } from './components/HomeDashboard'
+import { ReviewHistoryPanel } from './components/ReviewHistoryPanel'
 import { RiskPanel } from './components/RiskPanel'
+import { SideNav, type NavKey } from './components/SideNav'
 import { TopBar } from './components/TopBar'
-import type { EditSummary, ReviewHistoryItem, ReviewHistoryResponse, ReviewMeta, ReviewResultPayload } from './types'
+import { UploadDashboard } from './components/UploadDashboard'
+import type { EditSummary, ReviewHistoryItem, ReviewMeta, ReviewResultPayload } from './types'
 
 async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms))
 }
 
-type AppView = 'home' | 'review'
+type SessionReviewEntry = ReviewHistoryItem & {
+  file: File | null
+  meta: ReviewMeta | null
+  result: ReviewResultPayload | null
+}
 
-function pickFilenameFromHeader(contentDisposition: string | null) {
-  if (!contentDisposition) return null
-  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
-  if (utf8Match?.[1]) return decodeURIComponent(utf8Match[1])
-  const plainMatch = contentDisposition.match(/filename="?([^";]+)"?/i)
-  return plainMatch?.[1] || null
+type HistoryApiItem = {
+  run_id: string
+  file_name?: string
+  status: ReviewMeta['status']
+  step?: string
+  updated_at?: string
+  document_ready?: boolean
+}
+
+function pickFilenameFromDisposition(contentDisposition: string | null, fallback: string) {
+  if (!contentDisposition) return fallback
+  const utf8 = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8?.[1]) return decodeURIComponent(utf8[1])
+  const plain = contentDisposition.match(/filename="?([^";]+)"?/i)
+  return plain?.[1] || fallback
+}
+
+function createHistoryEntry(runId: string, file: File | null, meta?: ReviewMeta | null): SessionReviewEntry {
+  const now = new Date().toISOString()
+  return {
+    id: runId,
+    run_id: runId,
+    file_name: file?.name || meta?.file_name,
+    status: meta?.status || 'queued',
+    summary: meta?.step || '准备审查',
+    updated_at: now,
+    created_at: now,
+    available: true,
+    file,
+    meta: meta || null,
+    result: null
+  }
+}
+
+function upsertHistory(
+  entries: SessionReviewEntry[],
+  runId: string,
+  updater: (prev: SessionReviewEntry) => SessionReviewEntry,
+  fallbackFile: File | null,
+  fallbackMeta?: ReviewMeta | null
+) {
+  const idx = entries.findIndex((item) => item.run_id === runId)
+  if (idx >= 0) {
+    const next = [...entries]
+    next[idx] = updater(next[idx])
+    return next.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+  }
+  const created = updater(createHistoryEntry(runId, fallbackFile, fallbackMeta))
+  return [created, ...entries].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
 }
 
 export default function App() {
   const editorRef = useRef<DocumentEditorHandle | null>(null)
-  const [view, setView] = useState<AppView>('home')
+  const [activeNav, setActiveNav] = useState<NavKey>('upload')
   const [file, setFile] = useState<File | null>(null)
   const [runId, setRunId] = useState<string | null>(null)
   const [meta, setMeta] = useState<ReviewMeta | null>(null)
   const [result, setResult] = useState<ReviewResultPayload | null>(null)
   const [isReviewing, setIsReviewing] = useState(false)
   const [edits, setEdits] = useState<EditSummary[]>([])
-  const [historyItems, setHistoryItems] = useState<ReviewHistoryItem[]>([])
-  const [historyLoading, setHistoryLoading] = useState(false)
-  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [historyEntries, setHistoryEntries] = useState<SessionReviewEntry[]>([])
 
   const riskHighlights = useMemo(() => {
     const items = result?.risk_result_validated?.risk_result?.risk_items || []
@@ -62,30 +109,94 @@ export default function App() {
     return map
   }, [result])
 
-  const refreshHistory = useCallback(async () => {
-    try {
-      setHistoryLoading(true)
-      setHistoryError(null)
-      const resp = await fetch('/api/reviews/history?limit=30')
-      if (!resp.ok) {
-        throw new Error(await resp.text())
+  const riskCount = result?.risk_result_validated?.risk_result?.risk_items?.length || 0
+
+  const refreshHistoryFromApi = useCallback(async () => {
+    const resp = await fetch('/api/reviews/history?limit=30')
+    if (!resp.ok) return
+    const data = (await resp.json()) as { items?: HistoryApiItem[] }
+    const remoteItems = data.items || []
+    setHistoryEntries((entries) => {
+      const byRunId = new Map(entries.map((it) => [it.run_id, it]))
+      for (const item of remoteItems) {
+        const prev = byRunId.get(item.run_id)
+        byRunId.set(item.run_id, {
+          id: prev?.id || item.run_id,
+          run_id: item.run_id,
+          file_name: prev?.file_name || item.file_name,
+          status: item.status || prev?.status || 'queued',
+          summary: prev?.summary || item.step || item.status,
+          updated_at: item.updated_at || prev?.updated_at || new Date().toISOString(),
+          created_at: prev?.created_at || item.updated_at || new Date().toISOString(),
+          available: item.document_ready ?? prev?.available ?? true,
+          file: prev?.file ?? null,
+          meta: prev?.meta ?? null,
+          result: prev?.result ?? null
+        })
       }
-      const data = (await resp.json()) as ReviewHistoryResponse
-      setHistoryItems(data.items || [])
-    } catch (e) {
-      setHistoryError(String(e))
-    } finally {
-      setHistoryLoading(false)
-    }
+      return Array.from(byRunId.values()).sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+    })
   }, [])
 
-  useEffect(() => {
-    void refreshHistory()
-  }, [refreshHistory])
+  const openSessionReview = useCallback(async (item: ReviewHistoryItem) => {
+    setActiveNav('result')
+    setEdits([])
+
+    let nextMeta = item.meta ?? null
+    let nextFile = item.file ?? null
+    let nextResult = item.result ?? null
+
+    const statusResp = await fetch(`/api/reviews/${item.run_id}`)
+    if (statusResp.ok) {
+      nextMeta = (await statusResp.json()) as ReviewMeta
+    }
+
+    if (!nextFile) {
+      const docResp = await fetch(`/api/reviews/${item.run_id}/document`)
+      if (docResp.ok) {
+        const blob = await docResp.blob()
+        const fallbackName = nextMeta?.file_name || item.file_name || `${item.run_id}.docx`
+        const fileName = pickFilenameFromDisposition(docResp.headers.get('content-disposition'), fallbackName)
+        nextFile = new File([blob], fileName, { type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+      }
+    }
+
+    if ((nextMeta?.status === 'completed' || item.status === 'completed') && !nextResult) {
+      const resultResp = await fetch(`/api/reviews/${item.run_id}/result`)
+      if (resultResp.ok) {
+        nextResult = (await resultResp.json()) as ReviewResultPayload
+      }
+    }
+
+    setFile(nextFile)
+    setRunId(item.run_id)
+    setMeta(nextMeta)
+    setResult(nextResult)
+    setIsReviewing((nextMeta?.status || item.status) === 'queued' || (nextMeta?.status || item.status) === 'running')
+
+    setHistoryEntries((entries) =>
+      upsertHistory(
+        entries,
+        item.run_id,
+        (prev) => ({
+          ...prev,
+          file: nextFile,
+          meta: nextMeta,
+          result: nextResult,
+          file_name: prev.file_name || nextFile?.name || nextMeta?.file_name || item.file_name,
+          status: (nextMeta?.status || prev.status) as ReviewMeta['status'],
+          summary: prev.summary || nextMeta?.step || prev.status,
+          updated_at: new Date().toISOString(),
+          available: true
+        }),
+        nextFile,
+        nextMeta
+      )
+    )
+  }, [])
 
   const startReview = useCallback(async () => {
     if (!file) return
-    setView('review')
     setIsReviewing(true)
     setResult(null)
     setMeta(null)
@@ -102,46 +213,98 @@ export default function App() {
       const text = await resp.text()
       throw new Error(text)
     }
-    const data = (await resp.json()) as { run_id: string; status: 'queued' | 'running' | 'completed' | 'failed' }
-    setRunId(data.run_id)
-    setMeta({
+    const data = (await resp.json()) as { run_id: string }
+    const nextMeta: ReviewMeta = {
       run_id: data.run_id,
-      status: data.status || 'queued',
+      status: 'queued',
       file_name: file.name,
-      step: '任务已创建，等待执行',
-    })
+      step: '已上传，等待开始审查'
+    }
+    setRunId(data.run_id)
+    setMeta(nextMeta)
+    setHistoryEntries((entries) =>
+      upsertHistory(
+        entries,
+        data.run_id,
+        (prev) => ({
+          ...prev,
+          file,
+          meta: nextMeta,
+          result: null,
+          file_name: file.name,
+          status: 'queued',
+          summary: nextMeta.step || '已上传，等待开始审查',
+          updated_at: new Date().toISOString(),
+          available: true
+        }),
+        file,
+        nextMeta
+      )
+    )
+    setActiveNav('result')
   }, [file])
 
   useEffect(() => {
     let cancelled = false
-    if (!runId || !isReviewing) return
+    if (!runId) return
 
     ;(async () => {
       try {
         while (!cancelled) {
           const resp = await fetch(`/api/reviews/${runId}`)
-          if (!resp.ok) {
-            throw new Error(await resp.text())
-          }
           const m = (await resp.json()) as ReviewMeta
           if (cancelled) return
           setMeta(m)
+          setHistoryEntries((entries) =>
+            upsertHistory(
+              entries,
+              runId,
+              (prev) => ({
+                ...prev,
+                file: prev.file || file,
+                meta: m,
+                file_name: prev.file_name || file?.name || m.file_name,
+                status: m.status,
+                summary: m.error || m.warning || m.step || m.status,
+                updated_at: new Date().toISOString(),
+                available: true
+              }),
+              file,
+              m
+            )
+          )
 
           if (m.status === 'completed') {
             const r = await fetch(`/api/reviews/${runId}/result`)
-            if (!r.ok) {
-              throw new Error(await r.text())
-            }
             const payload = (await r.json()) as ReviewResultPayload
             if (cancelled) return
             setResult(payload)
             setIsReviewing(false)
-            await refreshHistory()
+            setHistoryEntries((entries) =>
+              upsertHistory(
+                entries,
+                runId,
+                (prev) => ({
+                  ...prev,
+                  file: prev.file || file,
+                  meta: m,
+                  result: payload,
+                  file_name: prev.file_name || file?.name || payload.file_name,
+                  status: 'completed',
+                  summary: payload.risk_result_validated?.error_message || `已完成 · ${payload.risk_result_validated?.risk_result?.risk_items?.length || 0} 个风险点`,
+                  updated_at: new Date().toISOString(),
+                  available: true
+                }),
+                file,
+                m
+              )
+            )
+            void refreshHistoryFromApi()
             break
           }
           if (m.status === 'failed') {
             setIsReviewing(false)
-            await refreshHistory()
+            void refreshHistoryFromApi()
             break
           }
           await sleep(1200)
@@ -149,7 +312,25 @@ export default function App() {
       } catch (e) {
         if (!cancelled) {
           setIsReviewing(false)
-          setMeta({ run_id: runId, status: 'failed', error: String(e) })
+          const failedMeta = { run_id: runId, status: 'failed', error: String(e) } as ReviewMeta
+          setMeta(failedMeta)
+          setHistoryEntries((entries) =>
+            upsertHistory(
+              entries,
+              runId,
+              (prev) => ({
+                ...prev,
+                file: prev.file || file,
+                meta: failedMeta,
+                status: 'failed',
+                summary: String(e),
+                updated_at: new Date().toISOString(),
+                available: true
+              }),
+              file,
+              failedMeta
+            )
+          )
         }
       }
     })()
@@ -157,125 +338,105 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [isReviewing, refreshHistory, runId])
+  }, [runId, file, refreshHistoryFromApi])
 
-  const loadHistoryRun = useCallback(async (targetRunId: string) => {
-    setView('review')
-    setIsReviewing(false)
-    setRunId(targetRunId)
-    setResult(null)
-    setEdits([])
-
-    const statusResp = await fetch(`/api/reviews/${targetRunId}`)
-    if (!statusResp.ok) {
-      throw new Error(await statusResp.text())
-    }
-    const statusMeta = (await statusResp.json()) as ReviewMeta
-    setMeta(statusMeta)
-
-    const docResp = await fetch(`/api/reviews/${targetRunId}/document`)
-    if (!docResp.ok) {
-      throw new Error(await docResp.text())
-    }
-    const docBlob = await docResp.blob()
-    const docName =
-      pickFilenameFromHeader(docResp.headers.get('content-disposition')) ||
-      statusMeta.file_name ||
-      `${targetRunId}.docx`
-    setFile(new File([docBlob], docName, { type: docBlob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }))
-
-    if (statusMeta.status === 'completed') {
-      const resultResp = await fetch(`/api/reviews/${targetRunId}/result`)
-      if (!resultResp.ok) {
-        throw new Error(await resultResp.text())
-      }
-      const payload = (await resultResp.json()) as ReviewResultPayload
-      setResult(payload)
-      setIsReviewing(false)
-      return
-    }
-
-    if (statusMeta.status === 'queued' || statusMeta.status === 'running') {
-      setIsReviewing(true)
-      return
-    }
-    setIsReviewing(false)
-  }, [])
+  useEffect(() => {
+    void refreshHistoryFromApi()
+  }, [refreshHistoryFromApi])
 
   const onLocateRisk = useCallback((opts: { anchorText?: string; evidenceText?: string; clauseUids?: string[] }) => {
     editorRef.current?.locateRisk(opts)
   }, [])
 
-  if (view === 'home') {
-    return (
-      <div className="appRoot appRoot--home">
-        <HomeDashboard
-          file={file}
-          isReviewing={isReviewing}
-          historyItems={historyItems}
-          historyLoading={historyLoading}
-          historyError={historyError}
-          onSelectFile={setFile}
-          onStartReview={async () => {
-            try {
-              await startReview()
-            } catch (e) {
-              setIsReviewing(false)
-              setView('home')
-              alert(`发起审查失败：${String(e)}`)
-            }
-          }}
-          onLoadHistoryRun={async (targetRunId) => {
-            try {
-              await loadHistoryRun(targetRunId)
-            } catch (e) {
-              setView('home')
-              alert(`加载历史运行失败：${String(e)}`)
-            }
-          }}
-          onRefreshHistory={() => {
-            void refreshHistory()
-          }}
-        />
-      </div>
-    )
-  }
+  const latestReview = historyEntries[0] || null
 
   return (
-    <div className="appRoot">
-      <TopBar
-        file={file}
-        statusText={statusText}
-        runId={runId}
-        downloadUrl={result?.download_url || null}
-        onBackHome={() => {
-          setView('home')
-          setIsReviewing(false)
-          void refreshHistory()
-        }}
+    <div className="appShell">
+      <SideNav
+        activeNav={activeNav}
+        onSelect={setActiveNav}
+        reviewCount={historyEntries.length}
+        currentRunId={runId}
       />
 
-      <div className="mainGrid">
-        <section className="docPane">
-          <div className="paneHeader">
-            <div className="paneTitle">合同原件（可编辑）</div>
-          </div>
-
-          <DocumentEditor
-            ref={editorRef}
+      <main className="contentShell">
+        {activeNav === 'upload' ? (
+          <UploadDashboard
             file={file}
-            edits={edits}
-            onEditsChange={setEdits}
-            riskHighlights={riskHighlights}
-            clauseTextByUid={clauseTextByUid}
-            className="docEditor"
+            setFile={setFile}
+            isReviewing={isReviewing}
+            onStartReview={async () => {
+              try {
+                await startReview()
+              } catch (e) {
+                alert(`发起审查失败：${String(e)}`)
+              }
+            }}
+            latestReview={latestReview}
+            onOpenLatest={async () => {
+              if (!latestReview) return
+              try {
+                await openSessionReview(latestReview)
+              } catch (e) {
+                alert(`打开历史记录失败：${String(e)}`)
+              }
+            }}
+            onOpenHistory={() => setActiveNav('history')}
           />
-        </section>
+        ) : null}
 
-        <aside className="riskPane">
-          <RiskPanel result={result} onLocateRisk={onLocateRisk} />
-        </aside>
-      </div>
+        {activeNav === 'history' ? (
+          <ReviewHistoryPanel
+            items={historyEntries}
+            onOpen={async (item) => {
+              try {
+                await openSessionReview(item)
+              } catch (e) {
+                alert(`打开历史记录失败：${String(e)}`)
+              }
+            }}
+            onStartNew={() => setActiveNav('upload')}
+          />
+        ) : null}
+
+        {activeNav === 'result' ? (
+          <div className="reviewWorkspace">
+            <TopBar
+              file={file}
+              statusText={statusText}
+              runId={runId}
+              riskCount={riskCount}
+              isReviewing={isReviewing}
+              onGoUpload={() => setActiveNav('upload')}
+              onGoHistory={() => setActiveNav('history')}
+              downloadUrl={result?.download_url || null}
+            />
+
+            <div className="mainGrid">
+              <section className="docPane glassPane">
+                <div className="paneHeader">
+                  <div className="paneTitle">合同原件</div>
+                  <div className="paneHint">支持原文定位、编辑修改和风险高亮。整体布局经过重新整理，更适合长时间审查。</div>
+                </div>
+
+                <DocumentEditor
+                  ref={editorRef}
+                  file={file}
+                  edits={edits}
+                  onEditsChange={setEdits}
+                  riskHighlights={riskHighlights}
+                  clauseTextByUid={clauseTextByUid}
+                  className="docEditor"
+                />
+              </section>
+
+              <aside className="riskPane glassPane">
+                <RiskPanel result={result} onLocateRisk={onLocateRisk} />
+              </aside>
+            </div>
+          </div>
+        ) : null}
+      </main>
     </div>
   )
 }
