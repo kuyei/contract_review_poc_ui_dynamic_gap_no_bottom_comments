@@ -6,20 +6,18 @@ import shutil
 import subprocess
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 RUN_ROOT = BASE_DIR / "data" / "runs"
 UPLOAD_ROOT = BASE_DIR / "data" / "uploads"
 WEB_META_ROOT = BASE_DIR / "data" / "web_meta"
-DEMO_FILE = BASE_DIR / "frontend" / "public" / "demo" / "review_payload.json"
 
 for path in (RUN_ROOT, UPLOAD_ROOT, WEB_META_ROOT):
     path.mkdir(parents=True, exist_ok=True)
@@ -52,11 +50,78 @@ def _write_meta(run_id: str, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _parse_iso_datetime(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _latest_mtime_iso(target: Path) -> str:
+    latest = target.stat().st_mtime
+    if target.is_dir():
+        for p in target.rglob("*"):
+            if p.is_file():
+                latest = max(latest, p.stat().st_mtime)
+    return datetime.utcfromtimestamp(latest).isoformat() + "Z"
+
+
+def _infer_meta_from_run(run_id: str) -> dict[str, Any]:
+    run_dir = RUN_ROOT / run_id
+    if not run_dir.exists() or not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="run_id 不存在")
+
+    merged_exists = (run_dir / "merged_clauses.json").exists()
+    validated_path = run_dir / "risk_result_validated.json"
+    status = "running"
+    step = "历史运行记录"
+    error: str | None = None
+
+    if merged_exists and validated_path.exists():
+        validated = _safe_json(validated_path) or {}
+        if bool(validated.get("is_valid")):
+            status = "completed"
+            step = "历史结果"
+        else:
+            status = "failed"
+            step = "历史结果校验失败"
+            error = validated.get("error_message") or "risk_result_validated.json 校验未通过"
+
+    source_doc = run_dir / "source.docx"
+    upload_doc = UPLOAD_ROOT / f"{run_id}.docx"
+    reviewed_doc = run_dir / "reviewed_comments.docx"
+    if source_doc.exists():
+        file_name = source_doc.name
+    elif upload_doc.exists():
+        file_name = upload_doc.name
+    elif reviewed_doc.exists():
+        file_name = reviewed_doc.name
+    else:
+        file_name = f"{run_id}.docx"
+
+    return {
+        "run_id": run_id,
+        "status": status,
+        "file_name": file_name,
+        "step": step,
+        "error": error,
+        "updated_at": _latest_mtime_iso(run_dir),
+    }
+
+
 def _read_meta(run_id: str) -> dict[str, Any]:
     path = _meta_path(run_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="run_id 不存在")
-    return json.loads(path.read_text(encoding="utf-8"))
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.setdefault("run_id", run_id)
+        payload.setdefault("updated_at", datetime.utcnow().isoformat() + "Z")
+        return payload
+    return _infer_meta_from_run(run_id)
 
 
 def _safe_json(path: Path) -> Any:
@@ -86,9 +151,68 @@ def _build_result_payload(run_id: str) -> dict[str, Any]:
     }
 
 
+def _resolve_document_path(run_id: str) -> Path | None:
+    run_dir = RUN_ROOT / run_id
+    for candidate in (
+        run_dir / "source.docx",
+        UPLOAD_ROOT / f"{run_id}.docx",
+        run_dir / "reviewed_comments.docx",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _to_history_item(meta: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(meta.get("run_id") or "")
+    run_dir = RUN_ROOT / run_id
+    reviewed_docx = run_dir / "reviewed_comments.docx"
+    document_path = _resolve_document_path(run_id)
+    return {
+        "run_id": run_id,
+        "file_name": meta.get("file_name"),
+        "status": meta.get("status") or "running",
+        "review_side": meta.get("review_side"),
+        "contract_type_hint": meta.get("contract_type_hint"),
+        "updated_at": meta.get("updated_at") or (_latest_mtime_iso(run_dir) if run_dir.exists() else None),
+        "step": meta.get("step"),
+        "warning": meta.get("warning"),
+        "error": meta.get("error"),
+        "download_ready": reviewed_docx.exists(),
+        "document_ready": document_path is not None,
+    }
+
+
+def _list_history_items(limit: int) -> list[dict[str, Any]]:
+    run_ids: set[str] = set()
+    for path in WEB_META_ROOT.glob("*.json"):
+        run_ids.add(path.stem)
+    for path in RUN_ROOT.iterdir():
+        if path.is_dir():
+            run_ids.add(path.name)
+
+    items: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        try:
+            meta = _read_meta(run_id)
+        except HTTPException:
+            continue
+        item = _to_history_item(meta)
+        items.append(item)
+
+    items.sort(key=lambda x: _parse_iso_datetime(x.get("updated_at")), reverse=True)
+    return items[:limit]
+
+
 def _run_pipeline(*, run_id: str, file_path: Path, file_name: str, review_side: str, contract_type_hint: str) -> None:
     run_dir = RUN_ROOT / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    source_docx = run_dir / "source.docx"
+    if not source_docx.exists():
+        try:
+            shutil.copy2(file_path, source_docx)
+        except Exception:
+            pass
     env = os.environ.copy()
     env["RUN_ROOT"] = str(RUN_ROOT)
     env["REVIEW_SIDE"] = review_side
@@ -184,20 +308,9 @@ def _run_pipeline(*, run_id: str, file_path: Path, file_name: str, review_side: 
     )
 
 
-class DemoResponse(BaseModel):
-    message: str
-
-
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.get("/api/demo/result")
-def demo_result() -> Any:
-    if not DEMO_FILE.exists():
-        raise HTTPException(status_code=404, detail="未找到演示数据")
-    return JSONResponse(json.loads(DEMO_FILE.read_text(encoding="utf-8")))
 
 
 @app.post("/api/reviews")
@@ -214,6 +327,12 @@ async def create_review(
     upload_path = UPLOAD_ROOT / f"{run_id}{suffix}"
     with upload_path.open("wb") as f:
         shutil.copyfileobj(file.file, f)
+    run_dir = RUN_ROOT / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(upload_path, run_dir / "source.docx")
+    except Exception:
+        pass
 
     _write_meta(
         run_id,
@@ -239,6 +358,11 @@ async def create_review(
     return {"run_id": run_id, "status": "queued"}
 
 
+@app.get("/api/reviews/history")
+def get_review_history(limit: int = Query(30, ge=1, le=200)) -> dict[str, Any]:
+    return {"items": _list_history_items(limit)}
+
+
 @app.get("/api/reviews/{run_id}")
 def get_review_status(run_id: str) -> dict[str, Any]:
     return _read_meta(run_id)
@@ -250,6 +374,18 @@ def get_review_result(run_id: str) -> dict[str, Any]:
     if meta.get("status") != "completed":
         raise HTTPException(status_code=409, detail="任务尚未完成")
     return _build_result_payload(run_id)
+
+
+@app.get("/api/reviews/{run_id}/document")
+def get_review_document(run_id: str) -> FileResponse:
+    output = _resolve_document_path(run_id)
+    if output is None:
+        raise HTTPException(status_code=404, detail="未找到该 run 对应的 DOCX")
+    return FileResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=output.name,
+    )
 
 
 @app.get("/api/reviews/{run_id}/download")

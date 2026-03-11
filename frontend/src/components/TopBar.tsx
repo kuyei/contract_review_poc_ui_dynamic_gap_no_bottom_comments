@@ -1,17 +1,12 @@
-import React, { useRef } from 'react'
+import React from 'react'
 
 export function TopBar(props: {
   file: File | null
-  setFile: (f: File | null) => void
   statusText: string
   runId: string | null
-  isReviewing: boolean
-  onStartReview: () => void
-  onLoadDemo: () => void
   downloadUrl: string | null
+  onBackHome: () => void
 }) {
-  const inputRef = useRef<HTMLInputElement | null>(null)
-
   return (
     <header className="topBar">
       <div className="topLeft">
@@ -24,25 +19,8 @@ export function TopBar(props: {
           {props.file ? props.file.name : '未选择合同文件'}
         </div>
 
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".docx"
-          style={{ display: 'none' }}
-          onChange={(e) => {
-            const f = e.target.files?.[0] || null
-            props.setFile(f)
-          }}
-        />
-
-        <button className="btn" onClick={() => inputRef.current?.click()}>
-          选择DOCX
-        </button>
-        <button className="btn btnPrimary" disabled={!props.file || props.isReviewing} onClick={props.onStartReview}>
-          {props.isReviewing ? '审查中…' : '发起审查'}
-        </button>
-        <button className="btn" onClick={props.onLoadDemo}>
-          加载演示
+        <button className="btn" onClick={props.onBackHome}>
+          返回首页
         </button>
 
         {props.downloadUrl ? (

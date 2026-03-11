@@ -1,12 +1,15 @@
+export type ReviewStatus = 'queued' | 'running' | 'completed' | 'failed'
+
 export type ReviewMeta = {
   run_id: string
-  status: 'queued' | 'running' | 'completed' | 'failed'
+  status: ReviewStatus
   file_name?: string
   review_side?: string
   contract_type_hint?: string
   step?: string
   error?: string
   warning?: string
+  updated_at?: string
 }
 
 export type Clause = {
@@ -66,4 +69,22 @@ export type EditSummary = {
   updatedAt: number
   startIndex: number
   endIndex: number
+}
+
+export type ReviewHistoryItem = {
+  run_id: string
+  status: ReviewStatus
+  file_name?: string
+  review_side?: string
+  contract_type_hint?: string
+  step?: string
+  error?: string
+  warning?: string
+  updated_at?: string
+  download_ready: boolean
+  document_ready: boolean
+}
+
+export type ReviewHistoryResponse = {
+  items: ReviewHistoryItem[]
 }
