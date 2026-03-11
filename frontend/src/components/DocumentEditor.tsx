@@ -98,6 +98,10 @@ export const DocumentEditor = forwardRef<
   const cardElsRef = useRef<Map<string, HTMLButtonElement>>(new Map())
   const sourceElsRef = useRef<Map<string, HTMLElement>>(new Map())
 
+  useEffect(() => {
+    setZoom(1)
+  }, [props.file])
+
   const applyRiskHighlights = () => {
     const highlights = (props.riskHighlights || []).map((t) => normalizeSearchText(t)).filter(Boolean)
     for (const el of blockElsRef.current.values()) {

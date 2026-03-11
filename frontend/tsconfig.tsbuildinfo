@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/types.ts","./src/components/documenteditor.tsx","./src/components/riskpanel.tsx","./src/components/topbar.tsx"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/main.tsx","./src/types.ts","./src/components/DocumentEditor.tsx","./src/components/ReviewHistoryPanel.tsx","./src/components/RiskPanel.tsx","./src/components/SideNav.tsx","./src/components/TopBar.tsx","./src/components/UploadDashboard.tsx"],"version":"5.9.3"}

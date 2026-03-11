@@ -404,6 +404,7 @@ export default function App() {
             <TopBar
               file={file}
               statusText={statusText}
+              statusKind={meta?.status || (isReviewing ? 'running' : null)}
               runId={runId}
               riskCount={riskCount}
               isReviewing={isReviewing}
@@ -416,7 +417,7 @@ export default function App() {
               <section className="docPane glassPane">
                 <div className="paneHeader">
                   <div className="paneTitle">合同原件</div>
-                  <div className="paneHint">支持原文定位、编辑修改和风险高亮。整体布局经过重新整理，更适合长时间审查。</div>
+                  <div className="paneHint">优先放大正文阅读区，支持原文定位、编辑修改和风险高亮。</div>
                 </div>
 
                 <DocumentEditor

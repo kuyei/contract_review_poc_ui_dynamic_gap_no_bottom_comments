@@ -34,9 +34,15 @@ function NavIcon(props: { kind: NavKey }) {
 
 const NAVS: Array<{ key: NavKey; label: string; desc: string }> = [
   { key: 'upload', label: '文件上传', desc: '开始新的合同审查' },
-  { key: 'history', label: '审查记录', desc: '查看本次会话中的运行' },
-  { key: 'result', label: '当前结果', desc: '查看文档与风险对照' }
+  { key: 'history', label: '审查记录', desc: '查看真实历史运行结果' },
+  { key: 'result', label: '当前结果', desc: '聚焦文档和风险对照' }
 ]
+
+const ACTIVE_LABELS: Record<NavKey, string> = {
+  upload: '文件上传',
+  history: '审查记录',
+  result: '当前结果'
+}
 
 export function SideNav(props: {
   activeNav: NavKey
@@ -50,11 +56,13 @@ export function SideNav(props: {
         <div className="brandBadge">CR</div>
         <div>
           <div className="brandTitle">Contract Review</div>
-          <div className="brandSubtitle">Apple-like Workspace</div>
+          <div className="brandSubtitle">Minimal Review Workspace</div>
         </div>
       </div>
 
-      <div className="navSectionLabel">导航</div>
+      <div className="navSectionLabel">工作区</div>
+      <div className="workspaceChip">当前视图：{ACTIVE_LABELS[props.activeNav]}</div>
+
       <nav className="navList">
         {NAVS.map((item) => (
           <button
@@ -73,10 +81,11 @@ export function SideNav(props: {
         ))}
       </nav>
 
-      <div className="sideCard">
+      <div className="sideCard sideCard--primary">
         <div className="sideCardLabel">当前会话</div>
-        <div className="sideCardValue">{props.reviewCount} 次审查</div>
-        <div className="sideCardHint">{props.currentRunId ? `最近运行：${props.currentRunId}` : '尚未发起新的审查任务'}</div>
+        <div className="sideCardValue">{props.reviewCount}</div>
+        <div className="sideCardUnit">次审查</div>
+        <div className="sideCardHint">{props.currentRunId ? `最近运行：${props.currentRunId}` : '还没有最近运行记录'}</div>
       </div>
     </aside>
   )

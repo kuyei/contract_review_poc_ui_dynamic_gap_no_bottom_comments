@@ -774,3 +774,303 @@ button, input { font: inherit; }
   .commentLines { display: none; }
   .docRow { width: auto; min-width: 100%; }
 }
+
+/* === Workspace refinement v2 === */
+.btn,
+.statusPill,
+.summaryPill,
+.workspaceChip,
+.metaCard,
+.metaValue,
+.metaLabel {
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.appShell {
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px;
+}
+
+.sideNav {
+  padding: 18px 14px;
+  border-radius: 30px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66));
+}
+
+.brandPanel {
+  gap: 10px;
+  padding: 8px 10px 16px;
+}
+
+.brandBadge {
+  width: 42px;
+  height: 42px;
+  border-radius: 16px;
+  box-shadow: 0 10px 24px rgba(17,24,39,0.16);
+}
+
+.workspaceChip {
+  margin: -4px 8px 4px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.74);
+  border: 1px solid rgba(15,23,42,0.06);
+  font-size: 12px;
+  font-weight: 600;
+  color: #475467;
+}
+
+.navList {
+  gap: 10px;
+}
+
+.navItem {
+  padding: 13px 12px;
+  border-radius: 20px;
+}
+
+.navItem--active {
+  background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(245,247,251,0.9));
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.9), 0 14px 28px rgba(15,23,42,0.10);
+}
+
+.navItem--active .navIconWrap {
+  box-shadow: inset 0 0 0 1px rgba(37,99,235,0.10);
+}
+
+.sideCard--primary {
+  border-radius: 24px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.88), rgba(246,247,251,0.76));
+}
+
+.sideCardUnit {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.contentShell {
+  border-radius: 30px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.52), rgba(255,255,255,0.42));
+}
+
+.reviewWorkspace {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+  padding: 16px;
+}
+
+.topBar {
+  margin: 0;
+  min-height: 90px;
+  padding: 16px 18px;
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+}
+
+.topBarLead {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(260px, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.brand--result {
+  min-width: 0;
+}
+
+.brandCopy {
+  min-width: 0;
+}
+
+.filePill {
+  max-width: none;
+  min-width: 0;
+  width: 100%;
+  padding: 11px 16px;
+  font-size: 13px;
+}
+
+.topBarRail {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.topBarActionGroup,
+.topBarMetaGroup {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topBarMetaGroup {
+  justify-content: flex-end;
+}
+
+.metaCard {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 360px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.84);
+  box-shadow: inset 0 0 0 1px rgba(15,23,42,0.06);
+}
+
+.metaCard--run {
+  flex-shrink: 1;
+}
+
+.metaLabel {
+  font-size: 12px;
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.metaValue {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  color: #344054;
+}
+
+.statusPill,
+.summaryPill {
+  height: 40px;
+  min-width: 88px;
+  justify-content: center;
+  padding: 0 16px;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.mainGrid {
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 360px);
+}
+
+.docPane,
+.riskPane {
+  border-radius: 24px;
+}
+
+.paneHeader {
+  padding: 16px 18px;
+}
+
+.paneHint {
+  margin-top: 6px;
+}
+
+.docToolbar {
+  padding: 0 14px;
+}
+
+.toolbarHint {
+  max-width: 640px;
+}
+
+.docRow {
+  padding: 16px 18px 40px;
+}
+
+.docRow--compact {
+  justify-content: center;
+}
+
+.docRow--withComments {
+  gap: 14px;
+  padding-right: 22px;
+}
+
+.docCanvas {
+  width: 940px;
+  max-width: 100%;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.commentGutter--open {
+  width: 236px;
+}
+
+.commentBalloon {
+  width: 208px;
+}
+
+.riskControls {
+  padding: 12px 12px 0;
+}
+
+.riskList {
+  padding: 12px;
+}
+
+.historyCardTop {
+  align-items: center;
+}
+
+@media (max-width: 1520px) {
+  .topBar {
+    grid-template-columns: 1fr;
+  }
+
+  .topBarRail {
+    justify-content: space-between;
+    flex-wrap: wrap;
+  }
+
+  .topBarActionGroup,
+  .topBarMetaGroup {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 1280px) {
+  .appShell {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .mainGrid {
+    grid-template-columns: minmax(0, 1fr) 320px;
+  }
+
+  .docCanvas {
+    width: 900px;
+  }
+}
+
+@media (max-width: 960px) {
+  .reviewWorkspace {
+    padding: 12px;
+  }
+
+  .topBarLead {
+    grid-template-columns: 1fr;
+  }
+
+  .topBarRail {
+    justify-content: flex-start;
+  }
+
+  .topBarMetaGroup {
+    justify-content: flex-start;
+  }
+}
