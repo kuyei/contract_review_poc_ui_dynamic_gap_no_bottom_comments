@@ -1,4 +1,5 @@
-import React, { useRef } from 'react'
+import React, { useRef, useState } from 'react'
+import { UploadCloud, FileText, ShieldCheck, Zap, Lightbulb, PenTool, CheckCircle2 } from 'lucide-react'
 import type { ReviewHistoryItem } from '../types'
 
 export function UploadDashboard(props: {
@@ -7,85 +8,144 @@ export function UploadDashboard(props: {
   isReviewing: boolean
   onStartReview: () => void
   latestReview: ReviewHistoryItem | null
+  recentItems: ReviewHistoryItem[]
+  stats: any
   onOpenLatest: () => void
   onOpenHistory: () => void
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const [isDragActive, setIsDragActive] = useState(false)
+
+  const pickFile = (nextFile: File | null) => {
+    if (!nextFile) return
+    props.setFile(nextFile)
+  }
 
   return (
     <div className="dashboardPage">
-      <section className="heroPanel glassPane">
-        <div className="eyebrow">合同审查工作台</div>
-        <h1 className="heroTitle">把上传、审查和回看记录拆成清晰的导航层级。</h1>
-        <p className="heroCopy">
-          现在首页只负责开始新任务和浏览记录，真正的文档对照审查放在“当前结果”里。整体采用苹果式简约风格：大留白、轻玻璃感、低噪声。
-        </p>
+      {/*
+        This page lives inside a scroll container.
+        If the inner wrapper uses flex + default shrink behavior, the upload card can get squashed
+        and its content will be clipped. Keep the layout scroll-first (not fit-first).
+      */}
+      <div className="dashboardScroll flex flex-col items-center justify-start">
+        {/*
+          NOTE: Homepage must not scroll.
+          Use responsive spacing (CSS clamp + height breakpoints) instead of zoom/scale.
+          Keep utility spacing minimal so CSS can adapt reliably.
+        */}
+        <div className="uploadHero shrink-0">
+          <div className="uploadHeroLogo">
+            <div className="w-10 h-10 bg-[#00b365] text-white rounded-full flex items-center justify-center font-bold mr-3">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-6 h-6"><path d="M2 12h4l2-3 4 6 2-3h4"/></svg>
+            </div>
+            <span className="font-bold text-2xl md:text-3xl tracking-wide text-gray-900">CHECKUP</span>
+          </div>
+          <div className="uploadHeroSubtitle">合同全能助手，AI赋能读/写/审</div>
+        </div>
 
-        <div className="heroActions">
-          <input
-            ref={inputRef}
-            type="file"
-            accept=".docx"
-            className="hiddenInput"
-            onChange={(e) => props.setFile(e.target.files?.[0] || null)}
-          />
-          <button className="btn btnDark" onClick={() => inputRef.current?.click()}>
-            选择 DOCX
-          </button>
-          <button className="btn btnPrimary" disabled={!props.file || props.isReviewing} onClick={props.onStartReview}>
+        <div className="uploadCardContainer w-full max-w-3xl shrink-0">
+          <div
+            className={`uploadCard ${isDragActive ? 'uploadCard--active' : ''}`}
+            onClick={() => inputRef.current?.click()}
+            onDragOver={(event) => {
+              event.preventDefault()
+              setIsDragActive(true)
+            }}
+            onDragLeave={() => setIsDragActive(false)}
+            onDrop={(event) => {
+              event.preventDefault()
+              setIsDragActive(false)
+              const nextFile = event.dataTransfer.files?.[0] || null
+              pickFile(nextFile)
+            }}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept=".docx"
+              className="hiddenInput"
+              onChange={(event) => pickFile(event.target.files?.[0] || null)}
+            />
+            
+            <div className="uploadIconWrap">
+              <UploadCloud size={32} className="text-[#00b365]" />
+            </div>
+            <div className="text-base md:text-lg font-medium text-gray-700 mb-2 md:mb-3 text-center">
+              拖拽或复制合同文件，或 <span className="text-[#00b365]">选择文件</span>
+            </div>
+            <div className="text-xs md:text-sm text-gray-400 flex items-center justify-center gap-2">
+              支持 <span className="inline-flex items-center gap-1 bg-gray-50 px-2 py-1 rounded border border-gray-200 text-[10px] md:text-xs font-medium mx-1"><FileText size={12} className="text-blue-600" /> DOCX</span>
+            </div>
+            {props.file && (
+              <div className="selectedFilePill">
+                已选择: {props.file.name}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="uploadActions shrink-0">
+          <button
+            className="startReviewBtn"
+            disabled={!props.file || props.isReviewing}
+            onClick={props.onStartReview}
+          >
             {props.isReviewing ? '审查中…' : '开始审查'}
           </button>
-          <button className="btn" onClick={props.onOpenHistory}>
-            查看记录
-          </button>
         </div>
 
-        <div className="heroFileCard">
-          <div className="heroFileLabel">当前文件</div>
-          <div className="heroFileName">{props.file ? props.file.name : '尚未选择合同文件'}</div>
-          <div className="heroFileHint">建议上传标准 DOCX 文件，当前默认走供应商视角与服务合同模板。</div>
+        {/* Figma-style Filler Elements */}
+        <div className="matrixSection shrink-0">
+          <div className="matrixHeader">
+            <h3 className="matrixTitle">
+              <Zap size={22} className="text-yellow-500 fill-yellow-500" /> 核心能力矩阵
+            </h3>
+            <p className="matrixSubtitle">全方位、智能化的合同审查体验</p>
+          </div>
+
+          <div className="matrixGrid">
+            {/* Card 1: Risk Identification */}
+            <div className="matrixCard group">
+              <div className="matrixIcon matrixIcon--blue">
+                <ShieldCheck size={26} />
+              </div>
+              <h4 className="matrixCardTitle">多维风险识别</h4>
+              <ul className="matrixList">
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 通用合同风险识别</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 行业特定风险识别</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 合同主体风险识别</li>
+              </ul>
+            </div>
+
+            {/* Card 2: Smart Suggestions */}
+            <div className="matrixCard group">
+              <div className="matrixIcon matrixIcon--amber">
+                <Lightbulb size={26} />
+              </div>
+              <h4 className="matrixCardTitle">智能审查建议</h4>
+              <ul className="matrixList">
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 快速定位合同风险点</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 智能风险提示与建议</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 智能推荐权威参考依据</li>
+              </ul>
+            </div>
+
+            {/* Card 3: AI Rewriting */}
+            <div className="matrixCard group">
+              <div className="matrixIcon matrixIcon--purple">
+                <PenTool size={26} />
+              </div>
+              <h4 className="matrixCardTitle">AI 辅助改写</h4>
+              <ul className="matrixList">
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> AI 智能改写合同原文</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 保持法务专业术语准确性</li>
+                <li className="flex items-start gap-2 text-[11px] md:text-xs text-gray-600"><CheckCircle2 size={14} className="text-[#00b365] mt-0.5 shrink-0" /> 支持改写内容人工二次修改</li>
+              </ul>
+            </div>
+          </div>
         </div>
-      </section>
-
-      <section className="dashboardGrid">
-        <article className="dashboardCard glassPane">
-          <div className="cardHeader">
-            <div>
-              <div className="cardTitle">上传引导</div>
-              <div className="cardHint">为首屏保留一个非常清爽的操作路径。</div>
-            </div>
-            <span className="statusChip">Step 1</span>
-          </div>
-          <ul className="featureList">
-            <li>先在首页选择 DOCX，再开始审查。</li>
-            <li>运行中自动切到结果视图，文档和风险分栏展示。</li>
-            <li>完成后会自动积累到“审查记录”。</li>
-          </ul>
-        </article>
-
-        <article className="dashboardCard glassPane">
-          <div className="cardHeader">
-            <div>
-              <div className="cardTitle">最近一次运行</div>
-              <div className="cardHint">随时从首页回到上次的结果页。</div>
-            </div>
-            <span className="statusChip">Quick Access</span>
-          </div>
-
-          {props.latestReview ? (
-            <>
-              <div className="latestMetaLine">{props.latestReview.file_name || props.latestReview.run_id}</div>
-              <div className="latestMetaSub">{props.latestReview.summary || props.latestReview.status}</div>
-              <div className="latestMetaSub">更新时间：{new Date(props.latestReview.updated_at).toLocaleString()}</div>
-              <button className="btn btnSoft" onClick={props.onOpenLatest}>
-                打开当前结果
-              </button>
-            </>
-          ) : (
-            <div className="emptyCardState">还没有运行记录，先上传一份合同试试看。</div>
-          )}
-        </article>
-      </section>
+      </div>
     </div>
   )
 }

@@ -53,6 +53,12 @@ class DifyWorkflowClient:
 
 def extract_blocking_outputs(workflow_response: dict[str, Any]) -> dict[str, Any]:
     data = workflow_response.get("data") or {}
+    status = str(data.get("status", "") or "").strip().lower()
+    error = data.get("error")
+    if error:
+        raise DifyWorkflowError(f"Workflow returned error: {error}")
+    if status in {"failed", "error", "stopped", "canceled", "cancelled"}:
+        raise DifyWorkflowError(f"Workflow status indicates failure: status={status}, data={data}")
     outputs = data.get("outputs")
     if not isinstance(outputs, dict):
         raise DifyWorkflowError(f"Workflow outputs missing or invalid: {workflow_response}")

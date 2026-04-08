@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from typing import Any
 
@@ -42,6 +43,18 @@ MISSING_CLAUSE_MARKERS = [
 
 
 CLAUSE_REF_SPLIT_RE = re.compile(r"\s*[、，,；;/]\s*")
+_WEAK_BASIS_PHRASES = {
+    "根据原文",
+    "依据原文",
+    "需要进一步人工审核",
+    "建议进一步人工审核",
+    "当前文本不足以支撑稳定履约与争议处理",
+    "相关条款存在缺失、留白或约定不明确",
+}
+
+_ALLOWED_RISK_LEVELS = {"high", "medium", "low"}
+_RISK_LEVEL_ALIASES = ("risk_level_level", "risk_level_candidate")
+logger = logging.getLogger(__name__)
 
 
 def normalize_text(text: str) -> str:
@@ -74,6 +87,80 @@ def _basis_summary(dimension: str, issue: str, evidence_text: str, boilerplate: 
     return f"{dimension}存在需要进一步人工审核的风险点。"
 
 
+def _is_weak_basis_text(text: str) -> bool:
+    norm = normalize_text(text)
+    if not norm:
+        return True
+    if norm in _WEAK_BASIS_PHRASES:
+        return True
+    if len(norm) <= 20 and any(marker in norm for marker in _WEAK_BASIS_PHRASES):
+        return True
+    return False
+
+
+def _append_dedup(parts: list[str], seen: set[str], value: str, *, allow_weak: bool = True) -> None:
+    norm = normalize_text(value)
+    if not norm:
+        return
+    if not allow_weak and _is_weak_basis_text(norm):
+        return
+    key = norm.lower()
+    if key in seen:
+        return
+    seen.add(key)
+    parts.append(norm)
+
+
+def _parse_normative_basis(normative_basis: Any) -> tuple[str, str, str]:
+    if isinstance(normative_basis, dict):
+        title = normalize_text(str(normative_basis.get("basis_title", "") or ""))
+        detail = normalize_text(str(normative_basis.get("basis_detail", "") or ""))
+        citation = normalize_text(str(normative_basis.get("citation_text", "") or ""))
+        return title, detail, citation
+    if isinstance(normative_basis, str):
+        return "", normalize_text(normative_basis), ""
+    return "", "", ""
+
+
+def _compose_structured_basis(item: dict[str, Any]) -> tuple[str, str] | None:
+    factual_basis = normalize_text(str(item.get("factual_basis", "") or ""))
+    reasoning_basis = normalize_text(str(item.get("reasoning_basis", "") or ""))
+    norm_title, norm_detail, norm_citation = _parse_normative_basis(item.get("normative_basis"))
+
+    all_candidates = [factual_basis, reasoning_basis, norm_title, norm_detail]
+    has_non_empty = any(all_candidates) or bool(norm_citation)
+    if not has_non_empty:
+        return None
+
+    non_weak_candidates = [p for p in all_candidates if p and not _is_weak_basis_text(p)]
+    if not non_weak_candidates:
+        return None
+
+    summary_parts: list[str] = []
+    summary_seen: set[str] = set()
+    _append_dedup(summary_parts, summary_seen, factual_basis, allow_weak=False)
+    _append_dedup(summary_parts, summary_seen, norm_title, allow_weak=False)
+    if len(summary_parts) < 2:
+        _append_dedup(summary_parts, summary_seen, norm_detail, allow_weak=False)
+    if len(summary_parts) < 2:
+        _append_dedup(summary_parts, summary_seen, reasoning_basis, allow_weak=False)
+    if not summary_parts:
+        _append_dedup(summary_parts, summary_seen, non_weak_candidates[0], allow_weak=False)
+
+    basis_parts: list[str] = []
+    basis_seen: set[str] = set()
+    _append_dedup(basis_parts, basis_seen, factual_basis, allow_weak=False)
+    _append_dedup(basis_parts, basis_seen, reasoning_basis, allow_weak=False)
+    _append_dedup(basis_parts, basis_seen, norm_title, allow_weak=False)
+    _append_dedup(basis_parts, basis_seen, norm_detail, allow_weak=False)
+    _append_dedup(basis_parts, basis_seen, norm_citation, allow_weak=True)
+
+    if not basis_parts:
+        return None
+
+    return "；".join(summary_parts[:2]), "；".join(basis_parts)
+
+
 def _review_reason(item: dict[str, Any], clause_metas: list[dict[str, Any]]) -> list[str]:
     reasons = ["POC阶段默认全量人工复核，禁止系统自动采纳或自动修改合同内容。"]
 
@@ -104,6 +191,35 @@ def _signature(item: dict[str, Any], clause_uids: list[str]) -> str:
         normalize_text(str(item.get("anchor_text", item.get("evidence_text", "")))).lower(),
     ]
     return "||".join(parts)
+
+
+def _ensure_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _normalize_risk_source_type(item: dict[str, Any]) -> str:
+    raw = str(item.get("risk_source_type", "") or "").strip()
+    if raw in {"anchored", "missing_clause", "multi_clause"}:
+        return raw
+    if bool(item.get("is_multi_clause_risk")):
+        return "multi_clause"
+    # Phase 1.1: do NOT infer missing_clause from text semantics by default.
+    # Explicit risk_source_type should be provided by upstream when needed.
+    return "anchored"
 
 
 def _is_missing_clause_risk(item: dict[str, Any]) -> bool:
@@ -286,6 +402,55 @@ def _extract_raw_risk_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _build_anchor_text(
+    item: dict[str, Any],
+    *,
+    clause_uids: list[str],
+    related_clause_uids: list[str],
+    exact_index: dict[str, list[dict[str, Any]]],
+) -> str:
+    existing_anchor = normalize_text(str(item.get("anchor_text", "") or ""))
+    if existing_anchor:
+        return existing_anchor
+
+    evidence_text = normalize_text(str(item.get("evidence_text", "") or ""))
+    if evidence_text:
+        return evidence_text
+
+    for uid in clause_uids:
+        metas = exact_index.get(uid) or []
+        if not metas:
+            continue
+        meta = metas[0]
+        text = normalize_text(str(meta.get("source_excerpt", "") or "")) or normalize_text(str(meta.get("clause_text", "") or ""))
+        if text:
+            return text
+
+    for uid in related_clause_uids:
+        metas = exact_index.get(uid) or []
+        if not metas:
+            continue
+        meta = metas[0]
+        text = normalize_text(str(meta.get("source_excerpt", "") or "")) or normalize_text(str(meta.get("clause_text", "") or ""))
+        if text:
+            return text
+
+    issue = normalize_text(str(item.get("issue", "") or ""))
+    if issue:
+        return issue
+    return normalize_text(str(item.get("basis_summary", "") or ""))
+
+
+def _pick_suggestion(item: dict[str, Any]) -> str:
+    suggestion_minimal = str(item.get("suggestion_minimal", "") or "").strip()
+    suggestion_optimized = str(item.get("suggestion_optimized", "") or "").strip()
+    if suggestion_minimal:
+        return suggestion_minimal
+    if suggestion_optimized:
+        return suggestion_optimized
+    return ""
+
+
 def _map_external_risk_item(raw_item: dict[str, Any]) -> dict[str, Any]:
     if "issue" in raw_item or "risk_label" in raw_item or "dimension" in raw_item:
         return dict(raw_item)
@@ -327,6 +492,42 @@ def _map_external_risk_item(raw_item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_risk_level_fields(item: dict[str, Any]) -> None:
+    source_field = "risk_level"
+    raw_level = str(item.get("risk_level", "") or "").strip()
+    if not raw_level:
+        for alias in _RISK_LEVEL_ALIASES:
+            alias_value = str(item.get(alias, "") or "").strip()
+            if alias_value:
+                raw_level = alias_value
+                source_field = alias
+                break
+    if not raw_level:
+        raw_level = "medium"
+
+    level = raw_level.lower()
+    if level in {"严重", "高"}:
+        level = "high"
+    elif level in {"中", "中等"}:
+        level = "medium"
+    elif level in {"低"}:
+        level = "low"
+    if level not in _ALLOWED_RISK_LEVELS:
+        level = "medium"
+    item["risk_level"] = level
+
+    if source_field != "risk_level":
+        logger.debug(
+            "risk_level filled from alias: risk_id=%s risk_code=%s source=%s",
+            item.get("risk_id", ""),
+            item.get("risk_code", ""),
+            source_field,
+        )
+
+    for alias in _RISK_LEVEL_ALIASES:
+        item.pop(alias, None)
+
+
 def normalize_and_dedupe_risks(
     payload: dict[str, Any],
     clauses: list[dict[str, Any]],
@@ -342,11 +543,19 @@ def normalize_and_dedupe_risks(
             continue
 
         item = _map_external_risk_item(raw_item)
+        _normalize_risk_level_fields(item)
         clause_ref = str(item.get("clause_id", "") or "").strip()
         anchor_text = str(item.get("anchor_text", "") or "")
         evidence_text = str(item.get("evidence_text", "") or "")
-        risk_source_type = "missing_clause" if _is_missing_clause_risk(item) else "anchored"
+        risk_source_type = _normalize_risk_source_type(item)
         item["risk_source_type"] = risk_source_type
+        item["suggestion_minimal"] = str(item.get("suggestion_minimal", "") or "").strip() or str(item.get("suggestion", "") or "").strip()
+        item["suggestion_optimized"] = str(item.get("suggestion_optimized", "") or "").strip()
+        item["suggestion"] = _pick_suggestion(item)
+        item["evidence_confidence"] = _to_optional_float(item.get("evidence_confidence"))
+        item["quality_flags"] = _ensure_string_list(item.get("quality_flags"))
+        related_clause_ids = _ensure_string_list(item.get("related_clause_ids"))
+        related_clause_uids = _ensure_string_list(item.get("related_clause_uids"))
 
         if risk_source_type == "missing_clause":
             clause_metas = []
@@ -376,21 +585,37 @@ def normalize_and_dedupe_risks(
         item["clause_uids"] = clause_uids
         item["display_clause_ids"] = display_clause_ids
         item["clause_ids"] = clause_ids
-        item["is_multi_clause_risk"] = len(clause_uids) > 1
+        if risk_source_type == "multi_clause":
+            item["is_multi_clause_risk"] = True
+        else:
+            item["is_multi_clause_risk"] = len(clause_uids) > 1
         item["needs_human_review"] = True
         item["status"] = "pending"
         item["auto_apply_allowed"] = False
         item["mapping_conflict"] = mapping_conflict
+        item["related_clause_ids"] = list(dict.fromkeys(related_clause_ids + clause_ids + display_clause_ids))
+        item["related_clause_uids"] = list(dict.fromkeys(related_clause_uids + clause_uids))
+        item["anchor_text"] = _build_anchor_text(
+            item,
+            clause_uids=clause_uids,
+            related_clause_uids=item["related_clause_uids"],
+            exact_index=exact_index,
+        )
 
         is_boilerplate = any(bool(meta.get("is_boilerplate_instruction")) for meta in clause_metas)
         issue = str(item.get("issue", "") or "")
         dimension = str(item.get("dimension", "") or "")
 
         rule_id = _basis_rule_id(dimension, is_boilerplate, issue)
-        basis_summary = _basis_summary(dimension, issue, evidence_text, is_boilerplate)
+        structured_basis = _compose_structured_basis(item)
+        if structured_basis is not None:
+            basis_summary, basis_text = structured_basis
+        else:
+            basis_summary = _basis_summary(dimension, issue, evidence_text, is_boilerplate)
+            basis_text = basis_summary
         item["basis_rule_id"] = rule_id
         item["basis_summary"] = basis_summary
-        item["basis"] = f"[{rule_id}] {basis_summary}"
+        item["basis"] = f"[{rule_id}] {basis_text}"
         item["review_required_reason"] = _review_reason(item, clause_metas)
         item["is_boilerplate_related"] = is_boilerplate
 
@@ -398,13 +623,19 @@ def normalize_and_dedupe_risks(
         existing = seen_signatures.get(signature)
         if existing is not None:
             existing.setdefault("merged_from_risk_ids", []).append(item.get("risk_id"))
-            for field in ["clause_uids", "display_clause_ids", "clause_ids"]:
+            for field in ["clause_uids", "display_clause_ids", "clause_ids", "related_clause_ids", "related_clause_uids", "quality_flags"]:
                 merged = list(dict.fromkeys((existing.get(field) or []) + (item.get(field) or [])))
                 existing[field] = merged
             existing["is_multi_clause_risk"] = len(existing.get("clause_uids") or []) > 1
             existing["clause_uid"] = (existing.get("clause_uids") or [existing.get("clause_uid", "")])[0]
             existing["display_clause_id"] = (existing.get("display_clause_ids") or [existing.get("display_clause_id", "")])[0]
             existing["clause_id"] = "、".join(existing.get("display_clause_ids") or []) or existing.get("clause_id", "")
+            if existing.get("risk_source_type") != "missing_clause" and (
+                existing.get("risk_source_type") == "multi_clause"
+                or len(existing.get("related_clause_uids") or []) > 1
+                or len(existing.get("related_clause_ids") or []) > 1
+            ):
+                existing["risk_source_type"] = "multi_clause"
             continue
 
         item["merged_from_risk_ids"] = [item.get("risk_id")]

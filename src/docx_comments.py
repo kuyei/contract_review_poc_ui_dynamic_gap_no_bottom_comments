@@ -244,34 +244,17 @@ def _resolve_clauses_for_risk(risk: dict[str, Any], by_uid: dict[str, dict[str, 
 
 
 def _build_comment_text(risk: dict[str, Any], clauses: list[dict[str, Any]]) -> str:
-    level = str(risk.get("risk_level") or "").upper()
-    label = str(risk.get("risk_label") or "未命名风险")
-    issue = str(risk.get("issue") or "")
-    suggestion = str(risk.get("suggestion") or "")
-    basis = str(risk.get("basis_summary") or risk.get("basis") or "")
-    clause_line = "、".join(
-        str(c.get("display_clause_id") or c.get("clause_id") or "")
-        for c in clauses
-        if str(c.get("display_clause_id") or c.get("clause_id") or "").strip()
+    issue = str(risk.get("issue") or risk.get("risk_label") or risk.get("title") or "").strip() or "—"
+    basis = str(risk.get("basis_summary") or risk.get("basis") or "").strip() or "—"
+    suggestion = str(risk.get("suggestion") or "").strip() or "—"
+
+    return "\n".join(
+        [
+            f"【问题】{issue}",
+            f"【依据】{basis}",
+            f"【建议】{suggestion}",
+        ]
     )
-
-    parts = [f"[{level}] {label}"]
-    if issue:
-        parts.append(f"问题：{issue}")
-    if basis:
-        parts.append(f"依据：{basis}")
-    if suggestion:
-        parts.append(f"建议：{suggestion}")
-    if clause_line and len(clauses) > 1:
-        parts.append(f"关联条款：{clause_line}")
-
-    is_boilerplate = bool(risk.get("is_boilerplate_related")) or any(
-        bool(c.get("is_boilerplate_instruction")) for c in clauses
-    )
-    if is_boilerplate:
-        parts.append("提示：当前条款仍含模板说明或留白内容，建议在定稿前补全或删除。")
-
-    return "\n".join(parts)
 
 def export_comments_to_docx(
     input_docx: Path,

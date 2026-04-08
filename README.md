@@ -58,13 +58,24 @@ python -m pip install -r requirements.txt
 ```env
 DIFY_BASE_URL=http://your-dify-host/v1
 DIFY_CLAUSE_WORKFLOW_API_KEY=app-xxxxx
-DIFY_RISK_WORKFLOW_API_KEY=app-yyyyy
+DIFY_RISK_WORKFLOW_API_KEY=app-legacy-risk
+DIFY_ANCHORED_RISK_WORKFLOW_API_KEY=app-anchored
+DIFY_MISSING_MULTI_RISK_WORKFLOW_API_KEY=app-missing-multi
+DIFY_FAST_SCREEN_WORKFLOW_API_KEY=app-fast-screen
 REVIEW_SIDE=supplier
 CONTRACT_TYPE_HINT=service_agreement
 REQUEST_TIMEOUT_SECONDS=900
 RUN_ROOT=data/runs
 DEBUG_SAVE_INTERMEDIATE=1
+FAST_SCREEN_ENABLED=1
+FAST_SCREEN_MAX_CANDIDATES=12
 ```
+
+说明：
+- 仍支持旧变量 `DIFY_RISK_WORKFLOW_API_KEY`（兼容回退）。
+- Anchored 风险工作流优先使用 `DIFY_ANCHORED_RISK_WORKFLOW_API_KEY`，缺失时回退到旧变量。
+- Missing / Multi-Clause 风险工作流优先使用 `DIFY_MISSING_MULTI_RISK_WORKFLOW_API_KEY`，缺失时回退到旧变量。
+- Fast Screen 工作流使用 `DIFY_FAST_SCREEN_WORKFLOW_API_KEY`，`FAST_SCREEN_ENABLED=1` 时必填。
 
 ## 运行
 
@@ -99,18 +110,26 @@ python app.py /path/to/contract.docx --run-id live_test_001 --resume
 ### `merged_clauses.json` 中新增字段
 - `clause_uid`: 稳定唯一主键
 - `source_clause_id`: 模型原始条款编号
-- `clause_kind`: `contract_clause` / `template_instruction`
+- `clause_kind`: `contract_clause` / `placeholder_clause` / `note_clause`（兼容旧值 `template_instruction`）
+- `source_excerpt`: 原文摘录（默认等于 `clause_text`）
+- `numbering_confidence`: 条款编号置信度（可为空）
+- `title_confidence`: 标题识别置信度（可为空）
 - `is_boilerplate_instruction`: 是否模板说明/填写提示
 - `text_hash`: 条款文本摘要 hash
 
 ### `risk_result_normalized.json` / `risk_result_validated.json` 中新增字段
 - `clause_uid`
+- `risk_source_type`: `anchored` / `missing_clause` / `multi_clause`
 - `basis_rule_id`
 - `basis_summary`
 - `review_required_reason`
 - `auto_apply_allowed`（固定为 false）
 - `is_boilerplate_related`
 - `merged_from_risk_ids`
+- `suggestion_minimal` / `suggestion_optimized`
+- `evidence_confidence`
+- `quality_flags`
+- `related_clause_ids` / `related_clause_uids`
 
 ## Dify Workflow 输入输出约定
 
@@ -122,6 +141,12 @@ python app.py /path/to/contract.docx --run-id live_test_001 --resume
 
 输出：
 - `clauses`（建议绑定到 LLM 节点 `text`）
+- 每个 clause 支持字段：`clause_id`、`clause_title`、`clause_text`、`segment_id`、`segment_title`、
+  `clause_kind`、`source_excerpt`、`numbering_confidence`、`title_confidence`
+- 默认值约定：
+  - `clause_kind`: `contract_clause`
+  - `source_excerpt`: 回退到 `clause_text`
+  - `numbering_confidence` / `title_confidence`: `null`
 
 ### Workflow B: Risk Reviewer
 输入：
@@ -131,6 +156,21 @@ python app.py /path/to/contract.docx --run-id live_test_001 --resume
 
 输出：
 - `text`（建议绑定到 LLM 节点 `text`）
+
+### Phase 3 风险双路架构（代码侧）
+- 风险识别链路已按代码接口拆成两路：
+  - Anchored 风险工作流（仅 anchored）
+  - Missing / Multi-Clause 风险工作流（仅 missing_clause / multi_clause）
+- Python 聚合层负责：
+  - normalize（统一补默认值、条款映射）
+  - validate（统一 schema 校验）
+  - dedupe（anchored/missing/multi 的确定性去重）
+  - 轻量规则回调（风险等级基线修正）
+- 本阶段尚未包含“风险精炼重写工作流”，后续阶段再接入。
+- Anchored 路径新增本地 Python 预处理：
+  - 对单条 clause 做确定性过滤（placeholder / note / 空白正文跳过）
+  - 构造标准化 anchored payload（含 `clause_context`）
+  - 仅当 `should_review=true` 才调用 Dify Anchored 风险工作流
 
 ## 说明
 - 当前版本默认**所有风险项都必须人工复核**。
@@ -180,4 +220,3 @@ python -m src.docx_comments ./1.docx \
 - 运行说明：`FRONTEND_RUN_GUIDE.md`
 
 前端支持：上传 DOCX、发起审查、轮询状态、展示三栏审查结果页、下载带批注 DOCX。
-

@@ -10,11 +10,44 @@ except Exception:  # pragma: no cover
     json_repair_loads = None
 
 
+_THINK_TAG_RE = re.compile(r"<\s*/?\s*think\s*>", flags=re.IGNORECASE)
+
+
+def remove_outer_think_blocks(text: str) -> str:
+    source = text or ""
+    if not source:
+        return source
+
+    parts: list[str] = []
+    depth = 0
+    cursor = 0
+
+    for match in _THINK_TAG_RE.finditer(source):
+        start, end = match.span()
+        tag = match.group(0)
+        is_closing = bool(re.match(r"<\s*/", tag))
+
+        if depth == 0 and cursor < start:
+            parts.append(source[cursor:start])
+
+        if is_closing:
+            if depth > 0:
+                depth -= 1
+        else:
+            depth += 1
+        cursor = end
+
+    if depth == 0 and cursor < len(source):
+        parts.append(source[cursor:])
+
+    return "".join(parts)
+
+
 def strip_markdown_json(text: str) -> str:
     cleaned = (text or "").strip()
-    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"^```\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+    cleaned = remove_outer_think_blocks(cleaned)
+    cleaned = re.sub(r"```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"```", "", cleaned)
     return cleaned.strip()
 
 
@@ -23,10 +56,7 @@ def _extract_first_json_candidate(text: str) -> str:
     if not text:
         return text
 
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = text.find(opener)
-        if start == -1:
-            continue
+    def _extract_from(start: int, opener: str, closer: str) -> str | None:
         depth = 0
         in_string = False
         escape = False
@@ -48,6 +78,24 @@ def _extract_first_json_candidate(text: str) -> str:
                 depth -= 1
                 if depth == 0:
                     return text[start:idx + 1]
+        return None
+
+    first = text[0]
+    if first in "{[":
+        direct = _extract_from(0, first, "}" if first == "{" else "]")
+        if direct is not None:
+            return direct
+        return text
+
+    starts = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        if start != -1:
+            starts.append((start, opener, closer))
+    for start, opener, closer in sorted(starts, key=lambda x: x[0]):
+        candidate = _extract_from(start, opener, closer)
+        if candidate is not None:
+            return candidate
     return text
 
 
@@ -55,10 +103,22 @@ def _load_json_with_repair(text: str) -> Any:
     last_error: Exception | None = None
     candidates = []
     cleaned = strip_markdown_json(text)
-    candidates.append(cleaned)
     extracted = _extract_first_json_candidate(cleaned)
+    candidates.append(extracted)
     if extracted != cleaned:
-        candidates.append(extracted)
+        candidates.append(cleaned)
+
+    needs_unescape = (
+        isinstance(extracted, str)
+        and not extracted.startswith('"')
+        and ('\\"risk_items\\"' in extracted or "\\n" in extracted or '\\"' in extracted)
+    )
+    if needs_unescape:
+        unescaped = extracted
+        unescaped = unescaped.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", '"')
+        unescaped = unescaped.replace('\\"', '"')
+        if unescaped != extracted:
+            candidates.append(unescaped)
 
     for candidate in candidates:
         try:
@@ -67,7 +127,14 @@ def _load_json_with_repair(text: str) -> Any:
             last_error = e
             if json_repair_loads is not None:
                 try:
-                    return json_repair_loads(candidate)
+                    repaired = json_repair_loads(candidate)
+                    if isinstance(candidate, str):
+                        c = candidate.strip()
+                        if c.startswith("{") and not isinstance(repaired, dict):
+                            continue
+                        if "risk_items" in c and not isinstance(repaired, dict):
+                            continue
+                    return repaired
                 except Exception as repair_e:
                     last_error = repair_e
 
@@ -164,9 +231,15 @@ def parse_risk_payload(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, str):
         raise ValueError("Unsupported risk payload type")
 
-    data = _load_json_with_repair(raw)
+    raw_text = raw
+    data = _load_json_with_repair(raw_text)
+    if isinstance(data, list):
+        if data and all(isinstance(item, dict) for item in data):
+            if any(("risk_code" in item) or ("risk_label" in item) or ("issue" in item) for item in data):
+                return {"risk_items": data}
     if not isinstance(data, dict):
-        raise ValueError("Risk payload is not a JSON object")
+        preview = str(raw_text or "").replace("\n", "\\n")[:300]
+        raise ValueError(f"Risk payload is not a JSON object. raw_preview={preview}")
     if isinstance(data.get("contract_risk_report"), dict):
         return _map_contract_risk_report_to_risk_items(data)
     return data

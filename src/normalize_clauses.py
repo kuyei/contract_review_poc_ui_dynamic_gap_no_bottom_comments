@@ -29,8 +29,10 @@ BOILERPLATE_PATTERNS = [
     r"待填写",
 ]
 
+_NON_WORD_RE = re.compile(r"[\W_]+", flags=re.UNICODE)
 
 _NUMERAL_PATTERN = r"[一二三四五六七八九十百0-9]+"
+ALLOWED_CLAUSE_KINDS = {"contract_clause", "placeholder_clause", "note_clause"}
 
 
 def chinese_to_int(text: str) -> int | None:
@@ -148,9 +150,47 @@ def is_boilerplate_instruction(text: str, title: str = "") -> bool:
     return any(re.search(pattern, sample) for pattern in BOILERPLATE_PATTERNS)
 
 
-def classify_clause_kind(text: str, title: str, is_boilerplate: bool) -> str:
+def _is_effectively_blank_clause(text: str, source_excerpt: str) -> bool:
+    # Placeholder detection focuses on body content, not title.
+    body = _NON_WORD_RE.sub("", str(text or "").strip())
+    if body:
+        return False
+    excerpt = _NON_WORD_RE.sub("", str(source_excerpt or "").strip())
+    return not excerpt
+
+
+def _normalize_clause_kind(kind: Any, *, text: str, source_excerpt: str, title: str, is_boilerplate: bool) -> str:
+    raw = str(kind or "").strip().lower()
+    if raw in ALLOWED_CLAUSE_KINDS:
+        return raw
+    if raw in {"template_instruction", "instruction", "template"}:
+        return "note_clause"
+    return classify_clause_kind(text, source_excerpt, title, is_boilerplate)
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        v = float(text)
+    except Exception:
+        return None
+    # Phase 2: keep confidence values in [0, 1] for stable downstream behavior.
+    if v < 0:
+        return 0.0
+    if v > 1:
+        return 1.0
+    return v
+
+
+def classify_clause_kind(text: str, source_excerpt: str, title: str, is_boilerplate: bool) -> str:
+    if _is_effectively_blank_clause(text, source_excerpt):
+        return "placeholder_clause"
     if is_boilerplate:
-        return "template_instruction"
+        return "note_clause"
     return "contract_clause"
 
 
@@ -159,22 +199,60 @@ def stable_text_hash(text: str) -> str:
     return digest[:10]
 
 
+def normalize_clause_record(clause: dict[str, Any], *, default_segment_id: str = "segment_unknown", default_segment_title: str = "") -> dict[str, Any]:
+    """Normalize Clause Schema v2 fields while preserving original payload keys."""
+    record = dict(clause)
+    clause_text = str(record.get("clause_text", "") or "").strip()
+    clause_title = str(record.get("clause_title", "") or "")
+    segment_id = str(record.get("segment_id", default_segment_id) or default_segment_id)
+    segment_title = str(record.get("segment_title", default_segment_title) or default_segment_title)
+    source_excerpt = str(record.get("source_excerpt", "") or "").strip() or clause_text
+    boilerplate = is_boilerplate_instruction(clause_text, clause_title)
+    clause_kind = _normalize_clause_kind(
+        record.get("clause_kind"),
+        text=clause_text,
+        source_excerpt=source_excerpt,
+        title=clause_title,
+        is_boilerplate=boilerplate,
+    )
+    numbering_confidence = _to_optional_float(record.get("numbering_confidence"))
+    title_confidence = _to_optional_float(record.get("title_confidence"))
+
+    record["segment_id"] = segment_id
+    record["segment_title"] = segment_title
+    record["clause_text"] = clause_text
+    record["clause_title"] = clause_title
+    record["clause_kind"] = clause_kind
+    record["source_excerpt"] = source_excerpt
+    record["numbering_confidence"] = numbering_confidence
+    record["title_confidence"] = title_confidence
+    return record
+
+
+def normalize_clause_records(clauses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [normalize_clause_record(c) for c in clauses]
+
+
 def normalize_clauses(clauses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen_uids: dict[str, int] = {}
 
-    for index, clause in enumerate(clauses, start=1):
+    prepared = normalize_clause_records(clauses)
+    for index, clause in enumerate(prepared, start=1):
         segment_id = str(clause.get("segment_id", "segment_unknown"))
         segment_title = str(clause.get("segment_title", "") or "")
         source_clause_id = str(clause.get("clause_id", "") or "")
         clause_title = str(clause.get("clause_title", "") or "")
         clause_text = str(clause.get("clause_text", "") or "").strip()
+        source_excerpt = str(clause.get("source_excerpt", "") or "").strip() or clause_text
 
         top_level = extract_top_level_from_segment_title(segment_title, segment_id)
         clause_id, local_clause_id, display_clause_id = derive_clause_ids(source_clause_id, top_level, index)
 
         boilerplate = is_boilerplate_instruction(clause_text, clause_title)
-        clause_kind = classify_clause_kind(clause_text, clause_title, boilerplate)
+        clause_kind = str(clause.get("clause_kind", "contract_clause") or "contract_clause")
+        numbering_confidence = _to_optional_float(clause.get("numbering_confidence"))
+        title_confidence = _to_optional_float(clause.get("title_confidence"))
         base_uid = f"{segment_id}::{clause_id}"
         uid = base_uid
         if uid in seen_uids:
@@ -195,6 +273,9 @@ def normalize_clauses(clauses: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "clause_title": clause_title,
                 "clause_text": clause_text,
                 "clause_kind": clause_kind,
+                "source_excerpt": source_excerpt,
+                "numbering_confidence": numbering_confidence,
+                "title_confidence": title_confidence,
                 "is_boilerplate_instruction": boilerplate,
                 "text_hash": stable_text_hash(clause_text),
             }

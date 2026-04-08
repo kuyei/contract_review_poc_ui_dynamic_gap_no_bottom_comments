@@ -5,6 +5,8 @@ export type ReviewMeta = {
   review_side?: string
   contract_type_hint?: string
   step?: string
+  progress?: number
+  message?: string
   error?: string
   warning?: string
 }
@@ -17,7 +19,10 @@ export type Clause = {
   display_clause_id: string
   clause_title?: string
   clause_text: string
-  clause_kind?: 'contract_clause' | 'template_instruction'
+  clause_kind?: 'contract_clause' | 'placeholder_clause' | 'note_clause' | 'template_instruction'
+  source_excerpt?: string
+  numbering_confidence?: number | null
+  title_confidence?: number | null
   is_boilerplate_instruction?: boolean
 }
 
@@ -30,12 +35,46 @@ export type RiskItem = {
   basis: string
   evidence_text?: string
   suggestion: string
+  suggestion_minimal?: string
+  suggestion_optimized?: string
+  evidence_confidence?: number | null
+  quality_flags?: string[]
+  related_clause_ids?: string[]
+  related_clause_uids?: string[]
   clause_id?: string
   anchor_text?: string
   status?: 'pending' | 'accepted' | 'rejected' | string
   clause_uid?: string
   clause_uids?: string[]
   display_clause_ids?: string[]
+  is_multi_clause_risk?: boolean
+  risk_source_type?: 'anchored' | 'missing_clause' | 'multi_clause'
+
+  /**
+   * Legacy AI apply payload (old backend).
+   * Kept for backward compatibility.
+   */
+  ai_apply?: {
+    state: string
+    edit_type?: string
+    target_text?: string
+    revised_text?: string
+    rationale?: string
+    comment_text?: string
+    applied_at?: string
+  }
+
+  /**
+   * New AI rewrite payload (latest backend).
+   */
+  ai_rewrite?: {
+    state: string
+    target_text: string
+    revised_text: string
+    comment_text: string
+    created_at: string
+  }
+  ai_rewrite_decision?: 'proposed' | 'accepted' | 'rejected' | string
 }
 
 export type ReviewResultPayload = {
@@ -65,6 +104,9 @@ export type EditSummary = {
   updatedAt: number
   startIndex: number
   endIndex: number
+  tagText?: string
+  kind?: 'normal' | 'suggest_insert'
+  sourceRiskId?: string
 }
 
 export type ReviewHistoryItem = {

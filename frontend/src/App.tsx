@@ -1,14 +1,31 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEditor'
 import { ReviewHistoryPanel } from './components/ReviewHistoryPanel'
 import { RiskPanel } from './components/RiskPanel'
 import { SideNav, type NavKey } from './components/SideNav'
+import { ModernSideNav } from './components/ModernSideNav'
 import { TopBar } from './components/TopBar'
+import { GlobalTopBar } from './components/GlobalTopBar'
 import { UploadDashboard } from './components/UploadDashboard'
+import { ReviewProgress } from './components/ReviewProgress'
 import type { EditSummary, ReviewHistoryItem, ReviewMeta, ReviewResultPayload } from './types'
 
 async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms))
+}
+
+async function readErrorDetail(resp: Response) {
+  const text = await resp.text()
+  if (!text) return '请求失败'
+  try {
+    const parsed = JSON.parse(text) as { detail?: string }
+    const detail = String(parsed?.detail || '').trim()
+    if (detail) return detail
+  } catch {
+    // ignore parse error and use raw text
+  }
+  return text
 }
 
 type SessionReviewEntry = ReviewHistoryItem & {
@@ -68,9 +85,412 @@ function upsertHistory(
   return [created, ...entries].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
 }
 
+const NEW_RUN_ID_STORAGE_KEY = 'markup:newRunId'
+const AUTO_AI_DISABLED_STORAGE_KEY = 'markup:autoAiApplyAllDisabled'
+const AUTO_AI_TRIGGERED_STORAGE_KEY = 'markup:autoAiApplyAllTriggeredRunIds'
+const ACTIVE_RUN_ID_STORAGE_KEY = 'markup:activeRunId'
+const PREVIEW_WAITING_QUERY_KEY = 'preview_waiting'
+const PREVIEW_AUTO_COMPLETE_QUERY_KEY = 'preview_auto_complete'
+
+function navFromPathname(pathname: string): NavKey {
+  const normalized = pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  if (normalized === '/history') return 'history'
+  if (normalized === '/review' || normalized.startsWith('/review/')) return 'result'
+  return 'upload'
+}
+
+function pathForNav(key: NavKey) {
+  if (key === 'history') return '/history'
+  if (key === 'result' || key === 'waiting') return '/review'
+  return '/upload'
+}
+
+function buildReviewPath(runId?: string | null) {
+  if (!runId) return '/review'
+  return `/review/${encodeURIComponent(runId)}`
+}
+
+function parseReviewRunId(pathname: string) {
+  const normalized = pathname !== '/' && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  if (!normalized || normalized === '/review') return null
+  const prefix = '/review/'
+  if (!normalized.startsWith(prefix)) return null
+  const raw = normalized.slice(prefix.length).trim()
+  if (!raw) return null
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
+
+function readSessionValue(key: string) {
+  try {
+    return window.sessionStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeSessionValue(key: string, value: string) {
+  try {
+    window.sessionStorage.setItem(key, value)
+  } catch {
+    return
+  }
+}
+
+function parseTriggeredRunIds(raw: string | null) {
+  if (!raw) return new Set<string>()
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return new Set<string>()
+    return new Set(parsed.map((it) => String(it)))
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function readLocalValue(key: string) {
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeLocalValue(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    return
+  }
+}
+
+function removeLocalValue(key: string) {
+  try {
+    window.localStorage.removeItem(key)
+  } catch {
+    return
+  }
+}
+
+function isPreviewWaitingMode() {
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const v = (params.get(PREVIEW_WAITING_QUERY_KEY) || '').toLowerCase()
+    return v === '1' || v === 'true' || v === 'yes'
+  } catch {
+    return false
+  }
+}
+
+function isPreviewAutoCompleteMode() {
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const v = (params.get(PREVIEW_AUTO_COMPLETE_QUERY_KEY) || '').toLowerCase()
+    return v === '1' || v === 'true' || v === 'yes'
+  } catch {
+    return false
+  }
+}
+
+function compactText(value: string) {
+  return value.replace(/\s+/g, '')
+}
+
+const CLAUSE_UID_PATTERN = /^segment_[A-Za-z0-9_-]+::[A-Za-z0-9_.()（）-]+$/
+const CLAUSE_REF_SPLIT_RE = /\s*[、，,；;/]\s*/
+const ACCEPT_OVERLAP_MESSAGE = '该风险点与已接受修改存在重叠，请手动处理或先撤销前一条修改。'
+
+function extractQuotedTarget(text: string) {
+  const candidates: string[] = []
+  const patterns = [/「([^」]{4,})」/g, /“([^”]{4,})”/g, /"([^"\n]{4,})"/g]
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const quoted = String(match[1] || '').trim()
+      if (!quoted) continue
+      if (CLAUSE_UID_PATTERN.test(quoted)) continue
+      candidates.push(quoted)
+    }
+  }
+  if (candidates.length === 0) return ''
+  candidates.sort((a, b) => b.length - a.length)
+  return candidates[0]
+}
+
+function stripWrappingQuotes(value: string) {
+  const raw = String(value || '').trim()
+  const pairs: Array<[string, string]> = [
+    ['“', '”'],
+    ['「', '」'],
+    ['"', '"'],
+    ["'", "'"]
+  ]
+  for (const [left, right] of pairs) {
+    if (raw.startsWith(left) && raw.endsWith(right) && raw.length > left.length + right.length) {
+      const inner = raw.slice(left.length, raw.length - right.length).trim()
+      if (inner) return inner
+    }
+  }
+  return raw
+}
+
+function sanitizeAiTargetText(value: string) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const normalized = raw.replace(/\s+/g, ' ')
+
+  let cleaned = normalized.replace(/^segment_[A-Za-z0-9_-]+::[A-Za-z0-9_.()（）-]+\s*/, '')
+  cleaned = cleaned.replace(
+    /^(?:(?:第?\s*[0-9一二三四五六七八九十百千万零〇.]+(?:条|款))\s*)?(?:条款)?(?:约定|规定|载明|提到|显示)?\s*[:：，,]?\s*/u,
+    ''
+  )
+  cleaned = stripWrappingQuotes(cleaned)
+  if (!cleaned) return ''
+  if (CLAUSE_UID_PATTERN.test(cleaned)) return ''
+  return cleaned
+}
+
+function sanitizeTargetForMatch(value: string) {
+  const cleaned = sanitizeAiTargetText(value)
+  if (!cleaned) return ''
+  const wrapped = stripWrappingQuotes(cleaned)
+  return wrapped || cleaned
+}
+
+function derivePatchTargetCandidates(risk: any, preferredTarget?: string, clauseTextByUid?: Record<string, string>) {
+  if (!risk || typeof risk !== 'object') return [] as string[]
+  const locator = risk.locator && typeof risk.locator === 'object' ? risk.locator : {}
+  const aiRewrite = risk.ai_rewrite && typeof risk.ai_rewrite === 'object' ? risk.ai_rewrite : {}
+  const aiApply = risk.ai_apply && typeof risk.ai_apply === 'object' ? risk.ai_apply : {}
+  const clauseUids = Array.isArray(risk.clause_uids) && risk.clause_uids.length > 0 ? risk.clause_uids : (Array.isArray(risk.related_clause_uids) ? risk.related_clause_uids : [])
+  const clauseTexts = clauseUids.map((uid: string) => String(clauseTextByUid?.[uid] || '')).filter(Boolean)
+
+  const buckets: string[][] = [
+    [String(locator.matched_text || '').trim()],
+    [String(preferredTarget || '').trim(), String(aiRewrite.target_text || '').trim(), String(aiApply.target_text || '').trim()],
+    [String(risk.target_text || '').trim()],
+    [String(risk.evidence_text || '').trim()],
+    [String(risk.anchor_text || '').trim()],
+    clauseTexts,
+  ]
+
+  const expansions = (raw: string) => {
+    const out: string[] = []
+    const base = String(raw || '').trim()
+    if (!base) return out
+    out.push(sanitizeAiTargetText(base))
+    out.push(sanitizeTargetForMatch(base))
+    const quoted = extractQuotedTarget(base)
+    if (quoted) out.push(sanitizeTargetForMatch(quoted))
+
+    const noEllipsis = base.replace(/\.\.\.|…/g, ' ').replace(/\s+/g, ' ').trim()
+    if (noEllipsis && noEllipsis !== base) {
+      out.push(sanitizeTargetForMatch(noEllipsis))
+    }
+
+    const splitParts = base
+      .split(/(?:\.\.\.|…|\n|；|。|;)/)
+      .map((part) => sanitizeTargetForMatch(part))
+      .filter(Boolean)
+    out.push(...splitParts)
+
+    const clauseTrimmed = splitParts.flatMap((part) => {
+      const variants = [
+        part,
+        part.replace(/^(?:第?\s*[0-9一二三四五六七八九十百千万零〇A-Za-z.]+(?:条|款)?\s*[:：])\s*/u, ''),
+        part.replace(/^(?:条款|条文|clause)\s*[0-9A-Za-z.]+\s*[:：]?\s*/iu, ''),
+      ]
+      return variants.map((item) => sanitizeTargetForMatch(item)).filter(Boolean)
+    })
+    out.push(...clauseTrimmed)
+    return out
+  }
+
+  const seen = new Set<string>()
+  const ranked: Array<{ text: string; rank: number }> = []
+  buckets.forEach((candidates, bucketIndex) => {
+    for (const candidate of candidates) {
+      for (const expanded of expansions(candidate)) {
+        const key = compactText(expanded)
+        if (!key || key.length < 2 || seen.has(key)) continue
+        seen.add(key)
+        ranked.push({ text: expanded, rank: bucketIndex })
+      }
+    }
+  })
+
+  ranked.sort((a, b) => {
+    const diff = a.rank - b.rank
+    if (diff !== 0) return diff
+    return compactText(b.text).length - compactText(a.text).length
+  })
+  return ranked.map((item) => item.text)
+}
+
+function isUsablePatchTarget(value: string) {
+  const clean = sanitizeTargetForMatch(value)
+  if (!clean) return false
+  if (CLAUSE_UID_PATTERN.test(clean)) return false
+  const compact = compactText(clean)
+  return compact.length >= 1
+}
+
+function pickBestPatchTarget(risk: any, preferredTarget?: string, clauseTextByUid?: Record<string, string>) {
+  const candidates = derivePatchTargetCandidates(risk, preferredTarget, clauseTextByUid).filter(isUsablePatchTarget)
+  const strong = candidates.find((text) => compactText(text).length >= 4)
+  return strong || candidates[0] || ''
+}
+
+function normalizeRiskTextForDisplay(value: unknown) {
+  return String(value || '')
+    .replace(/[【\[][^【】\[\]\n]{0,80}_[A-Za-z0-9-]{2,}[】\]]\s*/g, '')
+    .replace(/(?:^|\s)(?:RULE|TPL|POLICY|CHECK|REG|MODEL|STD|CLAUSE)_[A-Za-z0-9_-]+(?=\s|$)/g, ' ')
+    .replace(/segment_[A-Za-z0-9_-]+::[A-Za-z0-9_.()（）-]+/g, ' ')
+    .replace(/(?:条款|条文|clause)\s*[0-9]+(?:\.[A-Za-z0-9]+)+/gi, ' ')
+    .replace(/\b[0-9]+(?:\.[A-Za-z][A-Za-z0-9]*)+\b/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/([。！？])\s*；+/g, '$1')
+    .replace(/；+\s*([。！？])/g, '$1')
+    .replace(/；{2,}/g, '；')
+    .trim()
+}
+
+function pickSuggestionInsertText(risk: any) {
+  if (!risk || typeof risk !== 'object') return ''
+  const candidates = [
+    risk.suggestion,
+    risk.suggestion_optimized,
+    risk.suggestion_minimal,
+    risk.basis
+  ]
+  for (const candidate of candidates) {
+    const cleaned = normalizeRiskTextForDisplay(candidate)
+    if (cleaned) return cleaned
+  }
+  return ''
+}
+
+function isAcceptedRiskStatus(status: unknown) {
+  const normalized = String(status || '').trim().toLowerCase()
+  return normalized === 'accepted' || normalized === 'ai_applied'
+}
+
+function asClauseRefs(value: unknown): string[] {
+  const refs: string[] = []
+  const seen = new Set<string>()
+  const rawValues = Array.isArray(value) ? value : [value]
+  for (const raw of rawValues) {
+    const text = String(raw || '').trim()
+    if (!text) continue
+    const parts = text.split(CLAUSE_REF_SPLIT_RE).map((it) => it.trim()).filter(Boolean)
+    for (const part of parts) {
+      if (seen.has(part)) continue
+      seen.add(part)
+      refs.push(part)
+    }
+  }
+  return refs
+}
+
+function buildClauseUidAliasMap(clauses: unknown): Record<string, string> {
+  const map: Record<string, string> = {}
+  if (!Array.isArray(clauses)) return map
+  for (const clause of clauses) {
+    if (!clause || typeof clause !== 'object') continue
+    const clauseObj = clause as Record<string, unknown>
+    const uid = String(clauseObj.clause_uid || '').trim()
+    if (!uid) continue
+    map[uid] = uid
+    for (const field of ['clause_id', 'display_clause_id', 'local_clause_id', 'source_clause_id']) {
+      for (const ref of asClauseRefs(clauseObj[field])) {
+        if (!map[ref]) map[ref] = uid
+      }
+    }
+  }
+  return map
+}
+
+function collectRiskClauseKeys(risk: any, clauseAliasMap: Record<string, string>): string[] {
+  if (!risk || typeof risk !== 'object') return []
+  const keys = new Set<string>()
+
+  for (const field of ['clause_uids', 'related_clause_uids', 'clause_uid']) {
+    for (const uid of asClauseRefs((risk as any)?.[field])) {
+      keys.add(clauseAliasMap[uid] || uid)
+    }
+  }
+
+  for (const field of ['clause_ids', 'related_clause_ids', 'display_clause_ids', 'clause_id', 'display_clause_id']) {
+    for (const ref of asClauseRefs((risk as any)?.[field])) {
+      keys.add(clauseAliasMap[ref] || ref)
+    }
+  }
+
+  return Array.from(keys)
+}
+
+function hasClauseAcceptOverlap(
+  risks: any[],
+  targetRiskId: string,
+  clauseAliasMap: Record<string, string>
+) {
+  return findClauseAcceptOverlapRiskIds(risks, targetRiskId, clauseAliasMap).length > 0
+}
+
+function findClauseAcceptOverlapRiskIds(
+  risks: any[],
+  targetRiskId: string,
+  clauseAliasMap: Record<string, string>
+) {
+  const target = risks.find((it) => String(it?.risk_id) === String(targetRiskId))
+  if (!target) return [] as string[]
+  const targetKeys = new Set(collectRiskClauseKeys(target, clauseAliasMap))
+  if (targetKeys.size === 0) return [] as string[]
+
+  const overlapIds: string[] = []
+  for (const it of risks) {
+    if (!it || typeof it !== 'object') continue
+    if (String(it.risk_id) === String(targetRiskId)) continue
+    if (!isAcceptedRiskStatus(it.status)) continue
+    const clauseKeys = collectRiskClauseKeys(it, clauseAliasMap)
+    if (!clauseKeys.some((key) => targetKeys.has(key))) continue
+    overlapIds.push(String(it.risk_id))
+  }
+  return overlapIds
+}
+
+function AlertDialog(props: { open: boolean; title?: string; message: string; onClose: () => void }) {
+  if (!props.open) return null
+  return (
+    <div className="editorOverlay" onClick={props.onClose}>
+      <div className="editorSheet" onClick={(e) => e.stopPropagation()}>
+        <div className="editorHeader">
+          <div className="editorTitle">{props.title || '提示'}</div>
+          <div className="editorActions">
+            <button className="btnPrimarySolid" onClick={props.onClose}>
+              我知道了
+            </button>
+          </div>
+        </div>
+        <div className="editorBody">
+          <div className="editorReadonly">{props.message || '请求失败'}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
+  const navigate = useNavigate()
+  const location = useLocation()
   const editorRef = useRef<DocumentEditorHandle | null>(null)
-  const [activeNav, setActiveNav] = useState<NavKey>('upload')
+  const [activeNav, setActiveNav] = useState<NavKey>(() => navFromPathname(location.pathname))
+  // Legacy UI had a collapsible sidebar. In the current product flow we do NOT show a left sidebar
+  // on the review page (per Figma), so keep the flag only for backward compatibility.
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
+  const prevNavRef = useRef<NavKey>('upload')
   const [file, setFile] = useState<File | null>(null)
   const [runId, setRunId] = useState<string | null>(null)
   const [meta, setMeta] = useState<ReviewMeta | null>(null)
@@ -78,6 +498,301 @@ export default function App() {
   const [isReviewing, setIsReviewing] = useState(false)
   const [edits, setEdits] = useState<EditSummary[]>([])
   const [historyEntries, setHistoryEntries] = useState<SessionReviewEntry[]>([])
+  const [serverConfig, setServerConfig] = useState<{ review_side: string; contract_type_hint: string } | null>(null)
+  const [lastAcceptAllRiskIds, setLastAcceptAllRiskIds] = useState<string[]>([])
+  const [dialog, setDialog] = useState<{ open: boolean; title: string; message: string }>({
+    open: false,
+    title: '提示',
+    message: ''
+  })
+  const historyEntriesRef = useRef<SessionReviewEntry[]>([])
+
+  // Some deployments only support the legacy AI endpoint (/ai_apply).
+  // We auto-detect support for the newer AI rewrite endpoints once and cache the result
+  // to avoid repeated 404s (and to prevent accidental re-triggering).
+  const aiEndpointModeRef = useRef<'auto' | 'legacy' | 'new'>('auto')
+
+  // Prevent duplicate history fetch in React StrictMode (dev) which mounts components twice.
+  const historyFetchOnceRef = useRef(false)
+  const restoreRunOnceRef = useRef(false)
+  const pollingSeqRef = useRef(0)
+  const currentRunIdRef = useRef<string | null>(null)
+  const routeLoadingRunIdRef = useRef<string | null>(null)
+  const newRunIdRef = useRef<string | null>(readSessionValue(NEW_RUN_ID_STORAGE_KEY))
+  const autoAiTriggeredRef = useRef<Set<string>>(parseTriggeredRunIds(readSessionValue(AUTO_AI_TRIGGERED_STORAGE_KEY)))
+  const autoAiInFlightRef = useRef<Set<string>>(new Set())
+  const autoAiDisabledRef = useRef<boolean>(readSessionValue(AUTO_AI_DISABLED_STORAGE_KEY) === '1')
+  const previewWaitingRef = useRef<boolean>(isPreviewWaitingMode())
+  const previewAutoCompleteRef = useRef<boolean>(isPreviewAutoCompleteMode())
+  const routeRunId = parseReviewRunId(location.pathname)
+
+  const persistTriggeredRunIds = useCallback(() => {
+    writeSessionValue(AUTO_AI_TRIGGERED_STORAGE_KEY, JSON.stringify(Array.from(autoAiTriggeredRef.current)))
+  }, [])
+
+  const openDialog = useCallback((message: string, title = '提示') => {
+    setDialog({
+      open: true,
+      title,
+      message: String(message || '请求失败')
+    })
+  }, [])
+
+  useEffect(() => {
+    const originalAlert = window.alert.bind(window)
+    window.alert = (message?: any) => {
+      openDialog(String(message ?? ''))
+    }
+    return () => {
+      window.alert = originalAlert
+    }
+  }, [openDialog])
+
+  const maybeAutoApplyAllForRun = useCallback(
+    async (params: {
+      runId: string
+      meta: ReviewMeta | null
+      resultLoaded: boolean
+      fallbackFile: File | null
+    }) => {
+      const { runId: targetRunId, meta: targetMeta, resultLoaded, fallbackFile } = params
+      if (!resultLoaded) return
+      if (!targetMeta || targetMeta.status !== 'completed') return
+      if (autoAiDisabledRef.current) return
+      if (targetRunId !== newRunIdRef.current) return
+      if (autoAiTriggeredRef.current.has(targetRunId)) return
+      if (autoAiInFlightRef.current.has(targetRunId)) return
+
+      autoAiInFlightRef.current.add(targetRunId)
+
+      try {
+        const refreshResultOnce = async () => {
+          const refreshedResp = await fetch(`/api/reviews/${targetRunId}/result`)
+          if (!refreshedResp.ok) return false
+          const refreshed = (await refreshedResp.json()) as ReviewResultPayload
+
+          if (currentRunIdRef.current === targetRunId) {
+            setResult(refreshed)
+          }
+          setHistoryEntries((entries) =>
+            upsertHistory(
+              entries,
+              targetRunId,
+              (prev) => ({
+                ...prev,
+                file: prev.file || fallbackFile,
+                meta: targetMeta,
+                result: refreshed,
+                file_name: prev.file_name || fallbackFile?.name || refreshed.file_name,
+                status: 'completed',
+                summary: refreshed.risk_result_validated?.error_message || `已完成 · ${refreshed.risk_result_validated?.risk_result?.risk_items?.length || 0} 个风险点`,
+                updated_at: new Date().toISOString(),
+                available: true
+              }),
+              fallbackFile,
+              targetMeta
+            )
+          )
+          return true
+        }
+
+        let applyDone = false
+        let applyResp: Response | null = null
+        let applyErr: unknown = null
+        const applyTask = (async () => {
+          try {
+            applyResp = await fetch(`/api/reviews/${targetRunId}/ai_apply_all`, {
+              method: 'POST'
+            })
+          } catch (e) {
+            applyErr = e
+          } finally {
+            applyDone = true
+          }
+        })()
+
+        // While ai_apply_all is still running, poll result to progressively reflect completed rewrites.
+        const startedAt = Date.now()
+        while (!applyDone && Date.now() - startedAt < 180000) {
+          await sleep(1200)
+          if (targetMeta.status !== 'completed') break
+          try {
+            await refreshResultOnce()
+          } catch {
+            // ignore transient refresh failures during progressive polling
+          }
+        }
+
+        await applyTask
+        if (applyErr) {
+          throw applyErr
+        }
+        if (!applyResp) {
+          console.warn(`[auto ai_apply_all] no response for run ${targetRunId}`)
+          return
+        }
+        const finalResp = applyResp as Response
+
+        if (finalResp.status === 404) {
+          autoAiDisabledRef.current = true
+          writeSessionValue(AUTO_AI_DISABLED_STORAGE_KEY, '1')
+          console.warn(`[auto ai_apply_all] endpoint not supported for run ${targetRunId}, disable for this session`)
+          return
+        }
+        if (!finalResp.ok) {
+          console.warn(`[auto ai_apply_all] failed for run ${targetRunId}: ${finalResp.status}`)
+          return
+        }
+
+        // Mark as triggered ONLY after successful POST, so transient failures/aborts won't permanently lock this run.
+        autoAiTriggeredRef.current.add(targetRunId)
+        persistTriggeredRunIds()
+
+        const refreshedOk = await refreshResultOnce()
+        if (!refreshedOk) {
+          console.warn(`[auto ai_apply_all] refresh result failed for run ${targetRunId}`)
+          return
+        }
+      } catch (e: any) {
+        console.warn(`[auto ai_apply_all] failed for run ${targetRunId}:`, e)
+      } finally {
+        autoAiInFlightRef.current.delete(targetRunId)
+      }
+    },
+    [persistTriggeredRunIds]
+  )
+
+  // Remember the last non-result page so the review header "Back" button can return to it.
+  useEffect(() => {
+    if (activeNav !== 'result') prevNavRef.current = activeNav
+  }, [activeNav])
+
+  useEffect(() => {
+    currentRunIdRef.current = runId
+  }, [runId])
+
+  useEffect(() => {
+    setLastAcceptAllRiskIds([])
+  }, [runId])
+
+  useEffect(() => {
+    historyEntriesRef.current = historyEntries
+  }, [historyEntries])
+
+  useEffect(() => {
+    setActiveNav(navFromPathname(location.pathname))
+  }, [location.pathname])
+
+  useEffect(() => {
+    if (location.pathname === '/') {
+      navigate('/upload', { replace: true })
+    }
+  }, [location.pathname, navigate])
+
+  useEffect(() => {
+    const normalized = location.pathname !== '/' && location.pathname.endsWith('/') ? location.pathname.slice(0, -1) : location.pathname
+    if (normalized !== '/review') return
+    if (runId) {
+      navigate(buildReviewPath(runId), { replace: true })
+      return
+    }
+    navigate('/upload', { replace: true })
+  }, [location.pathname, navigate, runId])
+
+  useEffect(() => {
+    if (previewWaitingRef.current) return
+    if (routeRunId) return
+    if (restoreRunOnceRef.current) return
+    restoreRunOnceRef.current = true
+    const savedRunId = readLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+    if (!savedRunId) return
+    ;(async () => {
+      try {
+        const resp = await fetch(`/api/reviews/${savedRunId}`)
+        if (!resp.ok) {
+          removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+          return
+        }
+        const restoredMeta = (await resp.json()) as ReviewMeta
+        if (restoredMeta.status === 'queued' || restoredMeta.status === 'running') {
+          setRunId(savedRunId)
+          setMeta(restoredMeta)
+          setResult(null)
+          setIsReviewing(true)
+          navigate(buildReviewPath(savedRunId), { replace: true })
+          return
+        }
+        removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+      } catch {
+        removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+      }
+    })()
+  }, [navigate, routeRunId])
+
+  useEffect(() => {
+    if (!previewWaitingRef.current) return
+    const previewRunId = 'preview_waiting'
+    navigate(buildReviewPath(previewRunId), { replace: true })
+    setRunId(previewRunId)
+    setResult(null)
+    setIsReviewing(true)
+    setMeta({
+      run_id: previewRunId,
+      status: 'running',
+      step: '正在解析合同结构…',
+      progress: 36,
+      file_name: '示例合同.docx'
+    })
+  }, [navigate])
+
+  useEffect(() => {
+    if (!previewWaitingRef.current || !previewAutoCompleteRef.current) return
+    const timer = window.setTimeout(() => {
+      const previewRunId = 'preview_waiting'
+      setMeta({
+        run_id: previewRunId,
+        status: 'completed',
+        step: '已完成'
+      })
+      setIsReviewing(false)
+      setResult({
+        run_id: previewRunId,
+        status: 'completed',
+        file_name: '示例合同.docx',
+        review_side: 'supplier',
+        contract_type_hint: 'service_agreement',
+        merged_clauses: [],
+        risk_result_validated: {
+          is_valid: true,
+          risk_result: {
+            risk_items: [
+              {
+                risk_id: 1,
+                dimension: '违约责任',
+                risk_label: '违约金比例约定不明确',
+                risk_level: 'medium',
+                issue: '违约责任条款缺少明确违约金比例，执行时可能产生争议。',
+                basis: '合同应明确违约责任与计算方式，避免履约争议与举证困难。',
+                suggestion: '建议补充“违约金按未履行部分金额的5%计算”并明确支付时限。',
+                status: 'pending',
+                ai_rewrite: {
+                  state: 'succeeded',
+                  target_text: '违约责任条款',
+                  revised_text: '违约责任条款（含明确违约金比例与支付时限）',
+                  comment_text: '建议在违约责任条款中补充计算口径与履行时限。',
+                  created_at: new Date().toISOString()
+                },
+                ai_rewrite_decision: 'proposed'
+              }
+            ]
+          }
+        },
+        download_ready: false,
+        download_url: null
+      })
+    }, 2600)
+    return () => window.clearTimeout(timer)
+  }, [])
 
   const riskHighlights = useMemo(() => {
     const items = result?.risk_result_validated?.risk_result?.risk_items || []
@@ -110,11 +825,39 @@ export default function App() {
   }, [result])
 
   const riskCount = result?.risk_result_validated?.risk_result?.risk_items?.length || 0
+  const riskStats = useMemo(() => {
+    const items = result?.risk_result_validated?.risk_result?.risk_items || []
+    const next = { total: items.length, high: 0, medium: 0, low: 0 }
+    for (const r of items) {
+      if (r.risk_level === 'high') next.high += 1
+      else if (r.risk_level === 'medium') next.medium += 1
+      else if (r.risk_level === 'low') next.low += 1
+    }
+    return next
+  }, [result])
+
+  const historyStats = useMemo(() => {
+    let completed = 0
+    let running = 0
+    let failed = 0
+    for (const item of historyEntries) {
+      if (item.status === 'completed') completed += 1
+      if (item.status === 'running' || item.status === 'queued') running += 1
+      if (item.status === 'failed') failed += 1
+    }
+    return {
+      total: historyEntries.length,
+      completed,
+      running,
+      failed
+    }
+  }, [historyEntries])
 
   const refreshHistoryFromApi = useCallback(async () => {
-    const resp = await fetch('/api/reviews/history?limit=30')
-    if (!resp.ok) return
-    const data = (await resp.json()) as { items?: HistoryApiItem[] }
+    try {
+      const resp = await fetch('/api/reviews/history?limit=30')
+      if (!resp.ok) return
+      const data = (await resp.json()) as { items?: HistoryApiItem[] }
     const remoteItems = data.items || []
     setHistoryEntries((entries) => {
       const byRunId = new Map(entries.map((it) => [it.run_id, it]))
@@ -136,10 +879,18 @@ export default function App() {
       }
       return Array.from(byRunId.values()).sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
     })
+    } catch {
+      // Backend may be down during local development; do not spam the console.
+      return
+    }
   }, [])
 
   const openSessionReview = useCallback(async (item: ReviewHistoryItem) => {
-    setActiveNav('result')
+    if (item.available === false) {
+      alert('该审查记录缺少原始合同文件（后端返回 document_ready=false），无法打开。')
+      return
+    }
+
     setEdits([])
 
     let nextMeta = item.meta ?? null
@@ -151,6 +902,10 @@ export default function App() {
       nextMeta = (await statusResp.json()) as ReviewMeta
     }
 
+    const effectiveStatus = nextMeta?.status || item.status
+    // History review must never trigger auto ai_apply_all.
+    newRunIdRef.current = null
+
     if (!nextFile) {
       const docResp = await fetch(`/api/reviews/${item.run_id}/document`)
       if (docResp.ok) {
@@ -161,18 +916,26 @@ export default function App() {
       }
     }
 
-    if ((nextMeta?.status === 'completed' || item.status === 'completed') && !nextResult) {
+    if (effectiveStatus === 'completed' && !nextResult) {
       const resultResp = await fetch(`/api/reviews/${item.run_id}/result`)
       if (resultResp.ok) {
         nextResult = (await resultResp.json()) as ReviewResultPayload
       }
     }
 
+    navigate(buildReviewPath(item.run_id))
     setFile(nextFile)
     setRunId(item.run_id)
     setMeta(nextMeta)
-    setResult(nextResult)
-    setIsReviewing((nextMeta?.status || item.status) === 'queued' || (nextMeta?.status || item.status) === 'running')
+    if (effectiveStatus === 'queued' || effectiveStatus === 'running') {
+      setResult(null)
+      setIsReviewing(true)
+      writeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY, item.run_id)
+    } else {
+      setResult(nextResult)
+      setIsReviewing(false)
+      removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+    }
 
     setHistoryEntries((entries) =>
       upsertHistory(
@@ -185,7 +948,7 @@ export default function App() {
           result: nextResult,
           file_name: prev.file_name || nextFile?.name || nextMeta?.file_name || item.file_name,
           status: (nextMeta?.status || prev.status) as ReviewMeta['status'],
-          summary: prev.summary || nextMeta?.step || prev.status,
+          summary: nextMeta?.step || prev.summary || prev.status,
           updated_at: new Date().toISOString(),
           available: true
         }),
@@ -193,7 +956,8 @@ export default function App() {
         nextMeta
       )
     )
-  }, [])
+
+  }, [navigate])
 
   const startReview = useCallback(async () => {
     if (!file) return
@@ -205,8 +969,8 @@ export default function App() {
 
     const form = new FormData()
     form.append('file', file)
-    form.append('review_side', 'supplier')
-    form.append('contract_type_hint', 'service_agreement')
+    form.append('review_side', serverConfig?.review_side ?? 'supplier')
+    form.append('contract_type_hint', serverConfig?.contract_type_hint ?? 'service_agreement')
 
     const resp = await fetch('/api/reviews', { method: 'POST', body: form })
     if (!resp.ok) {
@@ -214,6 +978,9 @@ export default function App() {
       throw new Error(text)
     }
     const data = (await resp.json()) as { run_id: string }
+    newRunIdRef.current = data.run_id
+    writeSessionValue(NEW_RUN_ID_STORAGE_KEY, data.run_id)
+    writeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY, data.run_id)
     const nextMeta: ReviewMeta = {
       run_id: data.run_id,
       status: 'queued',
@@ -241,20 +1008,27 @@ export default function App() {
         nextMeta
       )
     )
-    setActiveNav('result')
-  }, [file])
+    navigate(buildReviewPath(data.run_id))
+  }, [file, navigate, serverConfig])
 
   useEffect(() => {
     let cancelled = false
-    if (!runId) return
+    const abortController = new AbortController()
+    pollingSeqRef.current += 1
+    const seq = pollingSeqRef.current
+    // Poll only when review workspace is visible and result has not been produced yet.
+    // Do NOT depend on `meta` here, otherwise every status update restarts and aborts the in-flight completed chain.
+    const shouldPoll = activeNav === 'result' && !result && !runId?.startsWith('preview_')
+    if (!runId || !shouldPoll) return
 
     ;(async () => {
       try {
-        while (!cancelled) {
-          const resp = await fetch(`/api/reviews/${runId}`)
+        while (!cancelled && pollingSeqRef.current === seq) {
+          const resp = await fetch(`/api/reviews/${runId}`, { signal: abortController.signal })
           const m = (await resp.json()) as ReviewMeta
           if (cancelled) return
           setMeta(m)
+          setIsReviewing(m.status === 'queued' || m.status === 'running')
           setHistoryEntries((entries) =>
             upsertHistory(
               entries,
@@ -275,45 +1049,71 @@ export default function App() {
           )
 
           if (m.status === 'completed') {
-            const r = await fetch(`/api/reviews/${runId}/result`)
-            const payload = (await r.json()) as ReviewResultPayload
+            const [docResp, resultResp] = await Promise.all([
+              fetch(`/api/reviews/${runId}/document`, { signal: abortController.signal }),
+              fetch(`/api/reviews/${runId}/result`, { signal: abortController.signal })
+            ])
+            if (!resultResp.ok) {
+              const text = await resultResp.text()
+              throw new Error(text || `获取结果失败（${resultResp.status}）`)
+            }
+            const payload = (await resultResp.json()) as ReviewResultPayload
+            let nextFile = file
+            if (docResp.ok) {
+              const blob = await docResp.blob()
+              const fallbackName = m.file_name || file?.name || `${runId}.docx`
+              const fileName = pickFilenameFromDisposition(docResp.headers.get('content-disposition'), fallbackName)
+              nextFile = new File([blob], fileName, { type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+            }
             if (cancelled) return
+            setFile(nextFile)
             setResult(payload)
             setIsReviewing(false)
+            navigate(buildReviewPath(runId), { replace: true })
+            removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
             setHistoryEntries((entries) =>
               upsertHistory(
                 entries,
                 runId,
                 (prev) => ({
                   ...prev,
-                  file: prev.file || file,
+                  file: prev.file || nextFile,
                   meta: m,
                   result: payload,
-                  file_name: prev.file_name || file?.name || payload.file_name,
+                  file_name: prev.file_name || nextFile?.name || payload.file_name,
                   status: 'completed',
                   summary: payload.risk_result_validated?.error_message || `已完成 · ${payload.risk_result_validated?.risk_result?.risk_items?.length || 0} 个风险点`,
                   updated_at: new Date().toISOString(),
                   available: true
                 }),
-                file,
+                nextFile,
                 m
               )
             )
+            await maybeAutoApplyAllForRun({
+              runId,
+              meta: m,
+              resultLoaded: true,
+              fallbackFile: nextFile
+            })
             void refreshHistoryFromApi()
             break
           }
           if (m.status === 'failed') {
             setIsReviewing(false)
+            removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
             void refreshHistoryFromApi()
             break
           }
-          await sleep(1200)
+          await sleep(1800)
         }
       } catch (e) {
+        if ((e as any)?.name === 'AbortError') return
         if (!cancelled) {
           setIsReviewing(false)
           const failedMeta = { run_id: runId, status: 'failed', error: String(e) } as ReviewMeta
           setMeta(failedMeta)
+          removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
           setHistoryEntries((entries) =>
             upsertHistory(
               entries,
@@ -337,107 +1137,855 @@ export default function App() {
 
     return () => {
       cancelled = true
+      abortController.abort()
     }
-  }, [runId, file, refreshHistoryFromApi])
+  }, [runId, file, activeNav, result, maybeAutoApplyAllForRun, refreshHistoryFromApi, navigate])
 
   useEffect(() => {
+    if (historyFetchOnceRef.current) return
+    historyFetchOnceRef.current = true
     void refreshHistoryFromApi()
   }, [refreshHistoryFromApi])
 
-  const onLocateRisk = useCallback((opts: { anchorText?: string; evidenceText?: string; clauseUids?: string[] }) => {
-    editorRef.current?.locateRisk(opts)
+  useEffect(() => {
+    void (async () => {
+      try {
+        const resp = await fetch('/api/config')
+        if (resp.ok) {
+          const config = (await resp.json()) as { review_side: string; contract_type_hint: string }
+          setServerConfig(config)
+        }
+      } catch {
+        // ignore config fetch errors, use backend defaults
+      }
+    })()
   }, [])
 
+  useEffect(() => {
+    if (previewWaitingRef.current) return
+    if (!routeRunId) return
+    if (routeRunId === runId) return
+    if (routeLoadingRunIdRef.current === routeRunId) return
+
+    routeLoadingRunIdRef.current = routeRunId
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const cached = historyEntriesRef.current.find((it) => it.run_id === routeRunId) || null
+        let nextMeta = cached?.meta ?? null
+        let nextFile = cached?.file ?? null
+        let nextResult = cached?.result ?? null
+
+        const statusResp = await fetch(`/api/reviews/${routeRunId}`)
+        if (!statusResp.ok) {
+          const text = await statusResp.text()
+          throw new Error(text || `获取审查状态失败（${statusResp.status}）`)
+        }
+        nextMeta = (await statusResp.json()) as ReviewMeta
+        const effectiveStatus = String(nextMeta?.status || '').toLowerCase()
+
+        if (!nextFile) {
+          const docResp = await fetch(`/api/reviews/${routeRunId}/document`)
+          if (docResp.ok) {
+            const blob = await docResp.blob()
+            const fallbackName = nextMeta?.file_name || cached?.file_name || `${routeRunId}.docx`
+            const fileName = pickFilenameFromDisposition(docResp.headers.get('content-disposition'), fallbackName)
+            nextFile = new File([blob], fileName, { type: blob.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+          }
+        }
+
+        if (effectiveStatus === 'completed') {
+          if (!nextResult) {
+            const resultResp = await fetch(`/api/reviews/${routeRunId}/result`)
+            if (!resultResp.ok) {
+              const text = await resultResp.text()
+              throw new Error(text || `获取审查结果失败（${resultResp.status}）`)
+            }
+            nextResult = (await resultResp.json()) as ReviewResultPayload
+          }
+        }
+
+        if (cancelled) return
+
+        setRunId(routeRunId)
+        setMeta(nextMeta)
+        setFile(nextFile)
+
+        if (effectiveStatus === 'queued' || effectiveStatus === 'running') {
+          setResult(null)
+          setIsReviewing(true)
+          writeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY, routeRunId)
+        } else {
+          setResult(nextResult)
+          setIsReviewing(false)
+          removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+        }
+
+        setHistoryEntries((entries) =>
+          upsertHistory(
+            entries,
+            routeRunId,
+            (prev) => ({
+              ...prev,
+              file: nextFile,
+              meta: nextMeta,
+              result: effectiveStatus === 'completed' ? nextResult : prev.result,
+              file_name: prev.file_name || nextFile?.name || nextMeta?.file_name || routeRunId,
+              status: (nextMeta?.status || prev.status) as ReviewMeta['status'],
+              summary: nextMeta?.error || nextMeta?.warning || nextMeta?.step || prev.summary || prev.status,
+              updated_at: new Date().toISOString(),
+              available: true
+            }),
+            nextFile,
+            nextMeta
+          )
+        )
+      } catch (e) {
+        if (cancelled) return
+        console.warn(`[review-route] failed to load run ${routeRunId}:`, e)
+        navigate('/history', { replace: true })
+        alert(`无法打开审查记录 ${routeRunId}：${String(e)}`)
+      } finally {
+        if (routeLoadingRunIdRef.current === routeRunId) {
+          routeLoadingRunIdRef.current = null
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [routeRunId, runId, navigate])
+
+  const onLocateRisk = useCallback((opts: { riskId?: number | string; targetText?: string; anchorText?: string; evidenceText?: string; clauseUids?: string[] }) => {
+    const { riskId, ...locateOpts } = opts
+    if (riskId !== undefined && riskId !== null) {
+      const items = (result?.risk_result_validated?.risk_result?.risk_items || []) as any[]
+      const clauseAliasMap = buildClauseUidAliasMap(result?.merged_clauses || [])
+      const overlapAcceptedIds = findClauseAcceptOverlapRiskIds(items, String(riskId), clauseAliasMap)
+      if (overlapAcceptedIds.length > 0) {
+        alert(
+          `该风险点对应条款已存在已接受修改（风险ID：${overlapAcceptedIds.join('、')}）。请先撤销已接受风险后再定位原文。`
+        )
+        return
+      }
+    }
+    editorRef.current?.locateRisk({
+      ...locateOpts,
+      targetText: sanitizeAiTargetText(String(locateOpts.targetText || '')),
+      anchorText: sanitizeAiTargetText(String(locateOpts.anchorText || '')),
+      evidenceText: sanitizeAiTargetText(String(locateOpts.evidenceText || ''))
+    })
+  }, [result])
+
+  /**
+   * Update a single risk item in both `result` and `historyEntries`.
+   * This is used by the new AI rewrite flow (ai_accept/ai_edit/ai_reject)
+   * to avoid duplicating state update code and reduce regression risk.
+   */
+  const mergeUpdatedRisk = useCallback(
+    (riskId: number | string, updated: any) => {
+      setResult((prev) => {
+        if (!prev) return prev
+        const nextItems = (prev.risk_result_validated?.risk_result?.risk_items || []).map((it) =>
+          String(it.risk_id) === String(riskId) ? { ...it, ...updated } : it
+        )
+        return {
+          ...prev,
+          risk_result_validated: {
+            ...prev.risk_result_validated,
+            risk_result: {
+              ...prev.risk_result_validated.risk_result,
+              risk_items: nextItems
+            }
+          }
+        }
+      })
+
+      setHistoryEntries((entries) =>
+        entries.map((entry) => {
+          if (entry.run_id !== runId || !entry.result) return entry
+          const nextItems = (entry.result.risk_result_validated?.risk_result?.risk_items || []).map((it) =>
+            String(it.risk_id) === String(riskId) ? { ...it, ...updated } : it
+          )
+          return {
+            ...entry,
+            result: {
+              ...entry.result,
+              risk_result_validated: {
+                ...entry.result.risk_result_validated,
+                risk_result: {
+                  ...entry.result.risk_result_validated.risk_result,
+                  risk_items: nextItems
+                }
+              }
+            },
+            updated_at: new Date().toISOString()
+          }
+        })
+      )
+    },
+    [runId, result]
+  )
+
+  const assertRiskAcceptAllowed = useCallback(
+    (riskId: number | string, riskItems?: any[]) => {
+      const items = (riskItems || result?.risk_result_validated?.risk_result?.risk_items || []) as any[]
+      const clauseAliasMap = buildClauseUidAliasMap(result?.merged_clauses || [])
+      if (hasClauseAcceptOverlap(items, String(riskId), clauseAliasMap)) {
+        throw new Error(ACCEPT_OVERLAP_MESSAGE)
+      }
+    },
+    [result]
+  )
+
+  const onRejectRisk = useCallback(
+    async (riskId: number | string) => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+      const isPreview = String(runId).startsWith('preview_')
+
+      if (!isPreview) {
+        const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'rejected' })
+        })
+        if (!resp.ok) {
+          throw new Error(await readErrorDetail(resp))
+        }
+      }
+      mergeUpdatedRisk(riskId, { status: 'rejected', ai_rewrite_decision: 'rejected' })
+      editorRef.current?.removeSuggestionInsertComment(riskId)
+    },
+    [runId, mergeUpdatedRisk]
+  )
+
+  const onSetRiskStatus = useCallback(
+    async (riskId: number | string, status: 'pending' | 'accepted' | 'rejected') => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+      if (status === 'accepted') {
+        assertRiskAcceptAllowed(riskId)
+      }
+      let handledByPayload = false
+      if (!String(runId).startsWith('preview_')) {
+        const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status })
+        })
+        if (!resp.ok) {
+          throw new Error(await readErrorDetail(resp))
+        }
+        const payload = (await resp.json()) as { item?: any }
+        if (payload.item) {
+          mergeUpdatedRisk(riskId, payload.item)
+          handledByPayload = true
+        }
+      }
+      if (!handledByPayload) {
+        mergeUpdatedRisk(
+          riskId,
+          status === 'pending' ? { status, ai_rewrite_decision: 'proposed', accepted_patch: undefined } : status === 'rejected' ? { status, ai_rewrite_decision: 'rejected', accepted_patch: undefined } : { status }
+        )
+      }
+      if (status === 'pending') {
+        editorRef.current?.revertAiPatch(riskId)
+        editorRef.current?.removeSuggestionInsertComment(riskId)
+      }
+    },
+    [runId, mergeUpdatedRisk, assertRiskAcceptAllowed]
+  )
+
+  const onAcceptRisk = useCallback(
+    async (riskId: number | string, opts?: { revisedText?: string }) => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+      const isPreview = String(runId).startsWith('preview_')
+      const items = (result?.risk_result_validated?.risk_result?.risk_items || []) as any[]
+      assertRiskAcceptAllowed(riskId, items)
+      const found = items.find((it) => String(it?.risk_id) === String(riskId))
+      const ai = (found?.ai_rewrite || found?.ai_apply || null) as any
+      const patchCandidates = derivePatchTargetCandidates(found, String(ai?.target_text || ''), clauseTextByUid)
+      const targetText = patchCandidates[0] || ''
+      const revisedText = String(opts?.revisedText || ai?.revised_text || '').trim()
+      const suggestionInsertText = normalizeRiskTextForDisplay(opts?.revisedText || pickSuggestionInsertText(found))
+      const aiState = String(ai?.state || '').toLowerCase()
+      const shouldApplyAi = Boolean(ai && (aiState === 'succeeded' || revisedText))
+      let appliedLocally = false
+      let acceptedTargetText = targetText
+      let acceptedRevisedText = revisedText
+
+      if (shouldApplyAi && revisedText && !targetText) {
+        throw new Error('未能在文档中定位到可替换文本，接受已取消。请先点击“定位原文”确认后再试。')
+      }
+
+      if (shouldApplyAi && revisedText) {
+        let applied = false
+        for (const candidate of patchCandidates) {
+          applied = editorRef.current?.applyAiPatch({ patchId: riskId, targetText: candidate, revisedText }) || false
+          if (applied) break
+        }
+        if (!applied) {
+          throw new Error('未能在文档中定位到可替换文本，接受已取消。请先点击“定位原文”确认后再试。')
+        }
+        appliedLocally = true
+        const appliedPatch = editorRef.current?.getAppliedAiPatch(riskId)
+        if (appliedPatch?.targetText) acceptedTargetText = appliedPatch.targetText
+        if (appliedPatch?.revisedText) acceptedRevisedText = appliedPatch.revisedText
+      }
+
+      try {
+        let acceptedByAiEndpoint = false
+        if (shouldApplyAi) {
+          if (!isPreview) {
+            const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}/ai_accept`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(
+                acceptedRevisedText
+                  ? {
+                      revised_text: acceptedRevisedText,
+                      target_text: acceptedTargetText || undefined,
+                      accepted_patch: {
+                        before_text: acceptedTargetText || undefined,
+                        after_text: acceptedRevisedText,
+                      },
+                    }
+                  : {}
+              )
+            })
+            if (!resp.ok) {
+              throw new Error(await readErrorDetail(resp))
+            }
+            const payload = (await resp.json()) as { item?: any }
+            if (payload.item) mergeUpdatedRisk(riskId, payload.item)
+            acceptedByAiEndpoint = true
+          } else {
+            mergeUpdatedRisk(riskId, { ai_rewrite_decision: 'accepted' })
+          }
+        }
+        if (!acceptedByAiEndpoint) {
+          await onSetRiskStatus(riskId, 'accepted')
+          if (!shouldApplyAi && suggestionInsertText) {
+            editorRef.current?.addSuggestionInsertComment({
+              riskId,
+              suggestionText: suggestionInsertText,
+              targetText,
+              anchorText: String(found?.anchor_text || ''),
+              evidenceText: String(found?.evidence_text || ''),
+              clauseUids:
+                (found?.clause_uids && found?.clause_uids.length > 0 ? found.clause_uids : found?.related_clause_uids) || []
+            })
+          }
+        }
+      } catch (error) {
+        if (appliedLocally) {
+          editorRef.current?.revertAiPatch(riskId)
+        }
+        throw error
+      }
+    },
+    [onSetRiskStatus, runId, result, mergeUpdatedRisk, assertRiskAcceptAllowed, clauseTextByUid]
+  )
+
+  const onAcceptAllRisks = useCallback(async () => {
+    if (!runId) throw new Error('当前没有可操作的 run_id')
+    const isPreview = String(runId).startsWith('preview_')
+    const currentItems = (result?.risk_result_validated?.risk_result?.risk_items || []) as any[]
+    const clauseAliasMap = buildClauseUidAliasMap(result?.merged_clauses || [])
+    const acceptedClauseKeys = new Set<string>()
+    let hasOverlapConflict = false
+    const acceptedRiskIds: string[] = []
+    for (const item of currentItems) {
+      if (!item || typeof item !== 'object') continue
+      if (!isAcceptedRiskStatus(item.status)) continue
+      for (const key of collectRiskClauseKeys(item, clauseAliasMap)) acceptedClauseKeys.add(key)
+    }
+    const failedRiskIds: string[] = []
+
+    for (const item of currentItems) {
+      const riskId = item?.risk_id
+      if (riskId === undefined || riskId === null) continue
+      const status = String(item?.status || 'pending').toLowerCase()
+      if (isAcceptedRiskStatus(status) || status === 'rejected') continue
+      const ai = (item?.ai_rewrite || item?.ai_apply || null) as any
+      const aiState = String(ai?.state || '').toLowerCase()
+      const patchCandidates = derivePatchTargetCandidates(item, String(ai?.target_text || ''), clauseTextByUid)
+      const targetText = patchCandidates[0] || ''
+      const revisedText = String(ai?.revised_text || '').trim()
+      const suggestionInsertText = pickSuggestionInsertText(item)
+      const shouldApplyAi = Boolean(ai && (aiState === 'succeeded' || revisedText))
+      let appliedLocally = false
+      let acceptedTargetText = targetText
+      let acceptedRevisedText = revisedText
+      const clauseKeys = collectRiskClauseKeys(item, clauseAliasMap)
+
+      try {
+        if (clauseKeys.length > 0 && clauseKeys.some((key) => acceptedClauseKeys.has(key))) {
+          throw new Error(ACCEPT_OVERLAP_MESSAGE)
+        }
+        let acceptedByAiEndpoint = false
+        if (shouldApplyAi && revisedText && patchCandidates.length === 0) {
+          throw new Error('未能在文档中定位到可替换文本')
+        }
+        if (shouldApplyAi && revisedText) {
+          let applied = false
+          for (const candidate of patchCandidates) {
+            applied = editorRef.current?.applyAiPatch({ patchId: riskId, targetText: candidate, revisedText }) || false
+            if (applied) break
+          }
+          if (!applied) {
+            throw new Error('未能在文档中定位到可替换文本')
+          }
+          appliedLocally = true
+          const appliedPatch = editorRef.current?.getAppliedAiPatch(riskId)
+          if (appliedPatch?.targetText) acceptedTargetText = appliedPatch.targetText
+          if (appliedPatch?.revisedText) acceptedRevisedText = appliedPatch.revisedText
+        }
+        if (shouldApplyAi) {
+          if (!isPreview) {
+            const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}/ai_accept`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(
+                acceptedRevisedText
+                  ? {
+                      revised_text: acceptedRevisedText,
+                      target_text: acceptedTargetText || undefined,
+                      accepted_patch: {
+                        before_text: acceptedTargetText || undefined,
+                        after_text: acceptedRevisedText,
+                      },
+                    }
+                  : {}
+              )
+            })
+            if (!resp.ok) {
+              throw new Error(await readErrorDetail(resp))
+            }
+            const payload = (await resp.json()) as { item?: any }
+            if (payload.item) mergeUpdatedRisk(riskId, payload.item)
+            acceptedByAiEndpoint = true
+          } else {
+            mergeUpdatedRisk(riskId, { ai_rewrite_decision: 'accepted' })
+          }
+        }
+        if (!acceptedByAiEndpoint) {
+          await onSetRiskStatus(riskId, 'accepted')
+          if (!shouldApplyAi && suggestionInsertText) {
+            editorRef.current?.addSuggestionInsertComment({
+              riskId,
+              suggestionText: suggestionInsertText,
+              targetText,
+              anchorText: String(item?.anchor_text || ''),
+              evidenceText: String(item?.evidence_text || ''),
+              clauseUids:
+                (item?.clause_uids && item?.clause_uids.length > 0 ? item.clause_uids : item?.related_clause_uids) || []
+            })
+          }
+        }
+        acceptedRiskIds.push(String(riskId))
+        for (const key of clauseKeys) acceptedClauseKeys.add(key)
+      } catch (error) {
+        const message = String((error as any)?.message || error || '')
+        if (message.includes('该风险点与已接受修改存在重叠')) {
+          hasOverlapConflict = true
+        }
+        if (appliedLocally) {
+          editorRef.current?.revertAiPatch(riskId)
+        }
+        failedRiskIds.push(String(riskId))
+        console.warn('accept all risk failed', riskId, error)
+      }
+    }
+
+    if (failedRiskIds.length > 0) {
+      if (acceptedRiskIds.length > 0) {
+        // Even if some items fail, allow "一键撤销接受全部" to rollback succeeded ones.
+        setLastAcceptAllRiskIds(acceptedRiskIds)
+      }
+      if (hasOverlapConflict) {
+        throw new Error(ACCEPT_OVERLAP_MESSAGE)
+      }
+      throw new Error(`以下风险未接受成功：${failedRiskIds.join('、')}`)
+    }
+    setLastAcceptAllRiskIds(acceptedRiskIds)
+  }, [runId, result, onSetRiskStatus, mergeUpdatedRisk, clauseTextByUid])
+
+  /**
+   * New AI rewrite flow (latest backend).
+   * We attempt the new endpoints first; if the backend hasn't been updated,
+   * we fall back to the legacy ai_apply / status patch behavior.
+   */
+  const onAiAcceptRisk = useCallback(
+    async (riskId: number | string, revisedText?: string) => {
+      await onAcceptRisk(riskId, revisedText ? { revisedText } : undefined)
+    },
+    [onAcceptRisk]
+  )
+
+  const onUndoAcceptAllRisks = useCallback(async () => {
+    if (lastAcceptAllRiskIds.length === 0) return
+    const failed: string[] = []
+    for (const riskId of lastAcceptAllRiskIds) {
+      try {
+        await onSetRiskStatus(riskId, 'pending')
+      } catch {
+        failed.push(riskId)
+      }
+    }
+    if (failed.length > 0) {
+      setLastAcceptAllRiskIds(failed)
+      throw new Error(`以下风险撤销失败：${failed.join('、')}`)
+    }
+    setLastAcceptAllRiskIds([])
+  }, [lastAcceptAllRiskIds, onSetRiskStatus])
+
+  const onAiEditRisk = useCallback(
+    async (riskId: number | string, revisedText: string) => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+      // New backend endpoint (optional). If unavailable (404), we fall back to local persistence.
+      // Even if we previously detected legacy mode, we still probe once here so upgrades take effect.
+
+      const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}/ai_edit`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ revised_text: revisedText })
+      })
+
+      if (resp.status === 404) {
+        aiEndpointModeRef.current = 'legacy'
+        const err: any = new Error('Not Found')
+        err.code = 404
+        throw err
+      }
+      if (!resp.ok) {
+        const text = await resp.text()
+        throw new Error(text || '请求失败')
+      }
+      aiEndpointModeRef.current = 'new'
+      const payload = (await resp.json()) as { item?: any }
+      if (payload.item) mergeUpdatedRisk(riskId, payload.item)
+    },
+    [runId, mergeUpdatedRisk, result]
+  )
+
+  const onAiRejectRisk = useCallback(
+    async (riskId: number | string) => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+
+      const tryNew = async () => {
+        const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}/ai_reject`, {
+          method: 'POST'
+        })
+        if (!resp.ok) {
+          const text = await resp.text()
+          throw new Error(text || '请求失败')
+        }
+        const payload = (await resp.json()) as { item?: any }
+        return payload.item
+      }
+
+      if (aiEndpointModeRef.current === 'legacy') {
+        await onRejectRisk(riskId)
+        return
+      }
+
+      try {
+        const updated = await tryNew()
+        aiEndpointModeRef.current = 'new'
+        if (updated) mergeUpdatedRisk(riskId, updated)
+      } catch (e: any) {
+        // fallback: treat as rejecting the whole risk (legacy)
+        const msg = String(e?.message || e)
+        if (msg.includes('404') || msg.includes('Not Found')) {
+          aiEndpointModeRef.current = 'legacy'
+          await onRejectRisk(riskId)
+        } else {
+          throw e
+        }
+      }
+    },
+    [runId, mergeUpdatedRisk, onRejectRisk]
+  )
+
+  const onAiApplyRisk = useCallback(
+    async (riskId: number | string) => {
+      if (!runId) throw new Error('当前没有可操作的 run_id')
+      const resp = await fetch(`/api/reviews/${runId}/risks/${encodeURIComponent(String(riskId))}/ai_apply`, {
+        method: 'POST'
+      })
+      if (!resp.ok) {
+        const text = await resp.text()
+        throw new Error(text || '请求失败')
+      }
+      const payload = (await resp.json()) as { item?: any }
+      const updated = payload.item
+      if (!updated) return
+      const aiApply = updated.ai_apply || {}
+      const patchRevisedText = String(aiApply.revised_text || '')
+      const items = (result?.risk_result_validated?.risk_result?.risk_items || []) as any[]
+      const found = items.find((it) => String(it?.risk_id) === String(riskId))
+      const mergedRiskForPatch = {
+        ...(found || {}),
+        ...(updated || {}),
+        ai_apply: {
+          ...((found?.ai_apply && typeof found.ai_apply === 'object') ? found.ai_apply : {}),
+          ...((updated?.ai_apply && typeof updated.ai_apply === 'object') ? updated.ai_apply : {})
+        },
+        ai_rewrite: {
+          ...((found?.ai_rewrite && typeof found.ai_rewrite === 'object') ? found.ai_rewrite : {}),
+          ...((updated?.ai_rewrite && typeof updated.ai_rewrite === 'object') ? updated.ai_rewrite : {})
+        }
+      }
+      const patchTargetText = pickBestPatchTarget(mergedRiskForPatch, String(aiApply.target_text || ''), clauseTextByUid)
+
+      setResult((prev) => {
+        if (!prev) return prev
+        const nextItems = (prev.risk_result_validated?.risk_result?.risk_items || []).map((it) =>
+          String(it.risk_id) === String(riskId) ? { ...it, ...updated } : it
+        )
+        return {
+          ...prev,
+          risk_result_validated: {
+            ...prev.risk_result_validated,
+            risk_result: {
+              ...prev.risk_result_validated.risk_result,
+              risk_items: nextItems
+            }
+          }
+        }
+      })
+      setHistoryEntries((entries) =>
+        entries.map((entry) => {
+          if (entry.run_id !== runId || !entry.result) return entry
+          const nextItems = (entry.result.risk_result_validated?.risk_result?.risk_items || []).map((it) =>
+            String(it.risk_id) === String(riskId) ? { ...it, ...updated } : it
+          )
+          return {
+            ...entry,
+            result: {
+              ...entry.result,
+              risk_result_validated: {
+                ...entry.result.risk_result_validated,
+                risk_result: {
+                  ...entry.result.risk_result_validated.risk_result,
+                  risk_items: nextItems
+                }
+              }
+            },
+            updated_at: new Date().toISOString()
+          }
+        })
+      )
+      if (patchTargetText && patchRevisedText) {
+        editorRef.current?.applyAiPatch({
+          patchId: riskId,
+          targetText: patchTargetText,
+          revisedText: patchRevisedText
+        })
+      }
+    },
+    [runId]
+  )
+
+  // IMPORTANT: Do NOT auto-trigger AI generation when opening history.
+  // Some deployments generate AI suggestions lazily and may overwrite previously reviewed
+  // suggestions or cause unnecessary backend work. AI generation should be user-driven.
+
+  const goUploadPage = useCallback(() => {
+    navigate(pathForNav('upload'))
+    setIsReviewing(false)
+    setRunId(null)
+    setMeta(null)
+    setResult(null)
+    setEdits([])
+    removeLocalValue(ACTIVE_RUN_ID_STORAGE_KEY)
+  }, [navigate])
+
+  const goHistoryPage = useCallback(() => {
+    navigate(pathForNav('history'))
+    setIsReviewing(false)
+  }, [navigate])
+
+  const onSelectMainNav = useCallback(
+    (key: NavKey) => {
+      if (key === 'upload') {
+        goUploadPage()
+        return
+      }
+      if (key === 'history') {
+        goHistoryPage()
+        return
+      }
+      if (key === 'waiting' && !runId) {
+        goUploadPage()
+        return
+      }
+      if (key === 'waiting' && runId) {
+        navigate(buildReviewPath(runId))
+        return
+      }
+      if (key === 'result' && runId) {
+        navigate(buildReviewPath(runId))
+        return
+      }
+      if (key === 'result' && !runId) {
+        goUploadPage()
+        return
+      }
+      navigate(pathForNav(key))
+    },
+    [goHistoryPage, goUploadPage, runId, navigate]
+  )
+
   const latestReview = historyEntries[0] || null
+  const recentHistory = historyEntries.slice(0, 4)
 
   return (
-    <div className="appShell">
-      <SideNav
-        activeNav={activeNav}
-        onSelect={setActiveNav}
-        reviewCount={historyEntries.length}
-        currentRunId={runId}
-      />
+    <>
+      {activeNav === 'result' ? (
+      // Review page: reuse the original (uploaded) review modules (TopBar/DocumentEditor/RiskPanel)
+      // but DO NOT show the left sidebar. The page gets its own full-screen surface.
+      <div className="legacyReview">
+        <div className="reviewOnlyShell">
+          <main className="contentShell">
+            <div className="reviewWorkspace">
+              <TopBar
+                file={file}
+                statusText={statusText}
+                runId={runId}
+                riskCount={riskCount}
+                riskStats={riskStats}
+                isReviewing={isReviewing}
+                onBack={() => navigate(pathForNav(prevNavRef.current))}
+                onGoUpload={goUploadPage}
+                onGoHistory={goHistoryPage}
+                downloadUrl={result?.download_url || null}
+                onAcceptAllRisks={onAcceptAllRisks}
+                onUndoAcceptAllRisks={onUndoAcceptAllRisks}
+                canAcceptAllRisks={riskStats.total > 0}
+                canUndoAcceptAllRisks={lastAcceptAllRiskIds.length > 0}
+              />
 
-      <main className="contentShell">
-        {activeNav === 'upload' ? (
-          <UploadDashboard
-            file={file}
-            setFile={setFile}
-            isReviewing={isReviewing}
-            onStartReview={async () => {
-              try {
-                await startReview()
-              } catch (e) {
-                alert(`发起审查失败：${String(e)}`)
-              }
-            }}
-            latestReview={latestReview}
-            onOpenLatest={async () => {
-              if (!latestReview) return
-              try {
-                await openSessionReview(latestReview)
-              } catch (e) {
-                alert(`打开历史记录失败：${String(e)}`)
-              }
-            }}
-            onOpenHistory={() => setActiveNav('history')}
-          />
-        ) : null}
+              <div className="mainGrid">
+                <section className="docPane glassPane">
+                  <div className="paneHeader">
+                    <div className="paneTitle">合同原件</div>
+                  </div>
 
-        {activeNav === 'history' ? (
-          <ReviewHistoryPanel
-            items={historyEntries}
-            onOpen={async (item) => {
-              try {
-                await openSessionReview(item)
-              } catch (e) {
-                alert(`打开历史记录失败：${String(e)}`)
-              }
-            }}
-            onStartNew={() => setActiveNav('upload')}
-          />
-        ) : null}
+                  <DocumentEditor
+                    ref={editorRef}
+                    file={file}
+                    edits={edits}
+                    onEditsChange={setEdits}
+                    riskHighlights={riskHighlights}
+                    clauseTextByUid={clauseTextByUid}
+                    className="docEditor"
+                  />
+                </section>
 
-        {activeNav === 'result' ? (
-          <div className="reviewWorkspace">
-            <TopBar
-              file={file}
-              statusText={statusText}
-              statusKind={meta?.status || (isReviewing ? 'running' : null)}
-              runId={runId}
-              riskCount={riskCount}
-              isReviewing={isReviewing}
-              onGoUpload={() => setActiveNav('upload')}
-              onGoHistory={() => setActiveNav('history')}
-              downloadUrl={result?.download_url || null}
-            />
-
-            <div className="mainGrid">
-              <section className="docPane glassPane">
-                <div className="paneHeader">
-                  <div className="paneTitle">合同原件</div>
-                  <div className="paneHint">优先放大正文阅读区，支持原文定位、编辑修改和风险高亮。</div>
-                </div>
-
-                <DocumentEditor
-                  ref={editorRef}
-                  file={file}
-                  edits={edits}
-                  onEditsChange={setEdits}
-                  riskHighlights={riskHighlights}
-                  clauseTextByUid={clauseTextByUid}
-                  className="docEditor"
-                />
-              </section>
-
-              <aside className="riskPane glassPane">
-                <RiskPanel result={result} onLocateRisk={onLocateRisk} />
-              </aside>
+                <aside className="riskPane glassPane">
+                  {result == null ? (
+                    <ReviewProgress
+                      meta={meta}
+                      runId={runId}
+                      onGoUpload={goUploadPage}
+                      onGoHistory={goHistoryPage}
+                      onRestart={goUploadPage}
+                    />
+                  ) : (
+                    <RiskPanel
+                      result={result}
+                      runId={runId}
+                      riskStats={riskStats}
+                      onLocateRisk={onLocateRisk}
+                      onAcceptRisk={onAcceptRisk}
+                      onRejectRisk={onRejectRisk}
+                      onSetRiskStatus={onSetRiskStatus}
+                      onAcceptAllRisks={onAcceptAllRisks}
+                      onAiApplyRisk={onAiApplyRisk}
+                      onAiAcceptRisk={onAiAcceptRisk}
+                      onAiEditRisk={onAiEditRisk}
+                      onAiRejectRisk={onAiRejectRisk}
+                    />
+                  )}
+                </aside>
+              </div>
             </div>
-          </div>
-        ) : null}
-      </main>
-    </div>
+          </main>
+        </div>
+      </div>
+      ) : (
+      <div className="appShell">
+        <ModernSideNav
+          activeNav={activeNav}
+          onSelect={onSelectMainNav}
+          recentItems={recentHistory}
+          activeRunId={runId}
+          onOpenRecent={async (item) => {
+            try {
+              await openSessionReview(item)
+            } catch (e) {
+              alert(`打开审查记录失败：${String(e)}`)
+            }
+          }}
+        />
+
+        <main className={`contentShell ${activeNav === 'upload' ? 'contentShell--noScroll' : ''}`}>
+          <GlobalTopBar />
+
+          {activeNav === 'upload' ? (
+            <UploadDashboard
+              file={file}
+              setFile={setFile}
+              isReviewing={isReviewing}
+              onStartReview={async () => {
+                try {
+                  await startReview()
+                } catch (e) {
+                  alert(`发起审查失败：${String(e)}`)
+                }
+              }}
+              latestReview={latestReview}
+              recentItems={recentHistory}
+              stats={historyStats}
+              onOpenLatest={async () => {
+                if (!latestReview) return
+                try {
+                  await openSessionReview(latestReview)
+                } catch (e) {
+                  alert(`打开历史记录失败：${String(e)}`)
+                }
+              }}
+              onOpenHistory={goHistoryPage}
+            />
+          ) : null}
+
+          {activeNav === 'history' ? (
+            <ReviewHistoryPanel
+              items={historyEntries}
+              stats={historyStats}
+              latestReview={latestReview}
+              onOpen={async (item) => {
+                try {
+                  await openSessionReview(item)
+                } catch (e) {
+                  alert(`打开历史记录失败：${String(e)}`)
+                }
+              }}
+              onStartNew={goUploadPage}
+            />
+          ) : null}
+        </main>
+      </div>
+      )}
+      <AlertDialog
+        open={dialog.open}
+        title={dialog.title}
+        message={dialog.message}
+        onClose={() => setDialog((prev) => ({ ...prev, open: false }))}
+      />
+    </>
   )
 }

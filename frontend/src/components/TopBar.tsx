@@ -1,31 +1,35 @@
 import React from 'react'
-import type { ReviewMeta } from '../types'
-
-function statusLabel(statusText: string, isReviewing: boolean) {
-  return statusText || (isReviewing ? '审查中…' : '等待开始')
-}
 
 export function TopBar(props: {
   file: File | null
   statusText: string
-  statusKind: ReviewMeta['status'] | null
   runId: string | null
   riskCount: number
+  riskStats?: { total: number; high: number; medium: number; low: number }
   isReviewing: boolean
+  onBack?: () => void
   onGoUpload: () => void
   onGoHistory: () => void
   downloadUrl: string | null
+  onAcceptAllRisks?: () => Promise<void> | void
+  onUndoAcceptAllRisks?: () => Promise<void> | void
+  canAcceptAllRisks?: boolean
+  canUndoAcceptAllRisks?: boolean
 }) {
-  const currentStatus = props.statusKind || (props.isReviewing ? 'running' : 'queued')
-
   return (
     <header className="topBar glassPane">
       <div className="topBarLead">
-        <div className="brand brand--result">
+        {props.onBack ? (
+          <button className="btn btnIcon" onClick={props.onBack} aria-label="返回">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M15 18L9 12L15 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        ) : null}
+        <div className="brand">
           <div className="brandDot" />
-          <div className="brandCopy">
+          <div>
             <div className="brandText">审查结果工作区</div>
-            <div className="brandSubText">文档、风险与操作分层展示，阅读区优先。</div>
           </div>
         </div>
 
@@ -34,12 +38,12 @@ export function TopBar(props: {
         </div>
       </div>
 
-      <div className="topBarRail">
-        <div className="topBarActionGroup">
-          <button className="btn btnSoft" onClick={props.onGoUpload}>
-            文件上传
+      <div className="topBarRight">
+        <div className="topBarActions">
+          <button className="btn" onClick={props.onGoUpload}>
+            上传新合同
           </button>
-          <button className="btn btnSoft" onClick={props.onGoHistory}>
+          <button className="btn" onClick={props.onGoHistory}>
             审查记录
           </button>
           {props.downloadUrl ? (
@@ -47,18 +51,26 @@ export function TopBar(props: {
               下载带批注 DOCX
             </a>
           ) : null}
+          <button
+            className="btn"
+            disabled={!props.canAcceptAllRisks || !props.onAcceptAllRisks}
+            onClick={async () => {
+              await props.onAcceptAllRisks?.()
+            }}
+          >
+            一键接受全部
+          </button>
+          <button
+            className="btn"
+            disabled={!props.canUndoAcceptAllRisks || !props.onUndoAcceptAllRisks}
+            onClick={async () => {
+              await props.onUndoAcceptAllRisks?.()
+            }}
+          >
+            一键撤销接受全部
+          </button>
         </div>
 
-        <div className="topBarMetaGroup">
-          {props.runId ? (
-            <div className="metaCard metaCard--run" title={props.runId}>
-              <span className="metaLabel">Run</span>
-              <span className="metaValue">{props.runId}</span>
-            </div>
-          ) : null}
-          <span className={`statusPill statusPill--${currentStatus}`}>{statusLabel(props.statusText, props.isReviewing)}</span>
-          <span className="summaryPill">{props.riskCount} 个风险点</span>
-        </div>
       </div>
     </header>
   )
